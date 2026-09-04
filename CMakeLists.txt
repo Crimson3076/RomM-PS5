@@ -37,8 +37,9 @@ endif()
 #          ELF (src/ps5/main_ps5.c) that talks to the console directly via
 #          SCE system libraries instead of SDL. VERIFIED to configure,
 #          compile, and link against a real, source-built SDK install
-#          pinned to that tag; NOT yet run on real PS5 hardware — see
-#          docs/testing.md for exactly what that means.
+#          pinned to that tag and exercised on a real PS5 through video,
+#          pad startup, config loading, and an HTTPS send attempt. See
+#          docs/testing.md for the current verified boundary.
 #
 # SDL is intentionally host-only: the ps5-payload-dev/sdk's own sample set
 # (samples/) has no SDL example and does not bundle SDL, and building the
@@ -125,11 +126,11 @@ if(ROMM_PS5_IS_PS5_TARGET)
   # SCE system libraries this ELF calls into directly — link flags copied
   # from the ps5-payload-dev/sdk v0.43 samples that use each one (browser,
   # hwinfo, http2_get: confirmed via that sample's own Makefile, which
-  # links "-lSceNet -lSceSsl -lSceHttp2"). ScePad/SceVideoOut/
-  # SceSystemService follow the same lib<Name>.so -> -l<Name> convention as
+  # links "-lSceNet -lSceSsl -lSceHttp2"). ScePad/SceVideoOut follow the
+  # same lib<Name>.so -> -l<Name> convention as
   # the others, confirmed against the matching sce_stubs/lib<Name>.so files
-  # in that same SDK (no sample links them, since no sample uses ScePad,
-  # video output, or SystemService — see src/ps5/pad.c and src/ps5/video.c
+  # in that same SDK (no sample links them, since no sample uses ScePad or
+  # video output; see src/ps5/pad.c and src/ps5/video.c
   # for what within each is sample-verified vs convention-inferred).
   target_link_libraries(rommps5-ps5 PRIVATE
     rommps5_core
@@ -140,7 +141,6 @@ if(ROMM_PS5_IS_PS5_TARGET)
     SceSsl
     SceHttp2
     SceVideoOut
-    SceSystemService
   )
 
 else()

@@ -13,7 +13,6 @@
 
 /* --- Verified against ps5-payload-dev/SDL's SDL_ps5video.c/.h (see
  * video.h) --- */
-int sceSystemServiceHideSplashScreen(void);
 
 int sceKernelAllocateMainDirectMemory(size_t, size_t, int, intptr_t *);
 int sceKernelMapDirectMemory(void **, size_t, int, int, intptr_t, size_t);
@@ -74,10 +73,11 @@ Video *video_init(void) {
     }
     video->handle = -1;
 
-    int rc = sceSystemServiceHideSplashScreen();
-    log_info("sceSystemServiceHideSplashScreen returned 0x%08x (%d)",
-             (unsigned int)rc, rc);
-
+    /* Do not call sceSystemServiceHideSplashScreen here. On a raw
+     * elfldr-launched payload it returns the LNC "not an application"
+     * error 0x80940004 and makes the system print repeated SceLncUtil
+     * warnings. VideoOut works without it, as the fourth hardware test
+     * confirmed. That call belongs to an LNC-managed application. */
     video->handle = sceVideoOutOpen(0xff, 0, 0, NULL);
     if (video->handle < 0) {
         int saved_errno = errno;
@@ -104,8 +104,8 @@ Video *video_init(void) {
              (unsigned int)VIDEO_MEM_ALIGN, VIDEO_BUFFER_COUNT);
 
     errno = 0;
-    rc = sceKernelAllocateMainDirectMemory(video->memsize, VIDEO_MEM_ALIGN, 3,
-                                            &video->paddr);
+    int rc = sceKernelAllocateMainDirectMemory(
+        video->memsize, VIDEO_MEM_ALIGN, 3, &video->paddr);
     if (rc != 0) {
         int saved_errno = errno;
         log_error("sceKernelAllocateMainDirectMemory failed: rc=0x%08x (%d), "

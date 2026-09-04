@@ -33,9 +33,15 @@ static bool read_file(const char *path, char *out, size_t out_capacity) {
 }
 
 void test_zip_extract(TestCounters *tc) {
-    char dest_root[64];
-    snprintf(dest_root, sizeof(dest_root), "/tmp/rommps5_test_zip_dest_%d",
-              getpid());
+    /* Use a unique directory instead of getpid(). Sandboxed test runners
+     * can reuse a PID while preserving /tmp between invocations, which
+     * made a second run falsely report the prior output as duplicate ZIP
+     * entries. */
+    char dest_root[] = "/tmp/rommps5_test_zip_dest_XXXXXX";
+    if (mkdtemp(dest_root) == NULL) {
+        TEST_CHECK(tc, false);
+        return;
+    }
 
     /* --- Happy path: two files, one directory entry --- */
     {

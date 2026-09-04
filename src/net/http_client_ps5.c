@@ -33,12 +33,15 @@
  * hardware testing shows authentication or content-length reporting
  * behaving strangely, look here first. See docs/testing.md.
  *
- * Everything in this file is compiled for the PS5 target only; it has
- * NOT been run on real hardware as of this commit.
+ * Startup, request creation, Authorization header insertion, and send
+ * have now run on real hardware. The first HTTPS send failed before an
+ * HTTP status was available; the detailed result logging below was added
+ * in response and still needs a hardware retest. See docs/testing.md.
  */
 #include "net/http_client_ps5.h"
 #include "log/log.h"
 
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -80,41 +83,63 @@ typedef struct {
 
 static Ps5HttpState g_state = {-1, -1, -1, -1, false};
 
+static void log_sce_error(const char *operation, int result,
+                          int saved_errno) {
+    log_error("%s failed: rc=0x%08x (%d), errno=%d (%s)", operation,
+              (unsigned int)result, result, saved_errno,
+              strerror(saved_errno));
+}
+
 bool http_client_ps5_startup(void) {
     if (g_state.ready) {
         return true;
     }
 
-    if (sceNetInit()) {
-        log_error("sceNetInit failed");
+    errno = 0;
+    int result = sceNetInit();
+    if (result != 0) {
+        log_sce_error("sceNetInit", result, errno);
         return false;
     }
+    log_info("sceNetInit succeeded");
 
+    errno = 0;
     g_state.net_pool = sceNetPoolCreate("rommps5", 32 * 1024, 0);
     if (g_state.net_pool < 0) {
-        log_error("sceNetPoolCreate failed: %d", g_state.net_pool);
+        log_sce_error("sceNetPoolCreate", g_state.net_pool, errno);
         return false;
     }
+    log_info("sceNetPoolCreate succeeded: pool_id=%d", g_state.net_pool);
 
+    errno = 0;
     g_state.ssl_ctx = sceSslInit(256 * 1024);
     if (g_state.ssl_ctx < 0) {
-        log_error("sceSslInit failed: %d", g_state.ssl_ctx);
+        log_sce_error("sceSslInit", g_state.ssl_ctx, errno);
+        http_client_ps5_shutdown();
         return false;
     }
+    log_info("sceSslInit succeeded: ssl_ctx=%d", g_state.ssl_ctx);
 
+    errno = 0;
     g_state.http_ctx =
         sceHttp2Init(g_state.net_pool, g_state.ssl_ctx, 256 * 1024, 1);
     if (g_state.http_ctx < 0) {
-        log_error("sceHttp2Init failed: %d", g_state.http_ctx);
+        log_sce_error("sceHttp2Init", g_state.http_ctx, errno);
+        http_client_ps5_shutdown();
         return false;
     }
+    log_info("sceHttp2Init succeeded: http_ctx=%d", g_state.http_ctx);
 
+    errno = 0;
     g_state.template_id =
         sceHttp2CreateTemplate(g_state.http_ctx, "RomM-PS5/0.1", 3, 1);
     if (g_state.template_id < 0) {
-        log_error("sceHttp2CreateTemplate failed: %d", g_state.template_id);
+        log_sce_error("sceHttp2CreateTemplate", g_state.template_id, errno);
+        http_client_ps5_shutdown();
         return false;
     }
+    log_info("sceHttp2CreateTemplate succeeded: template_id=%d",
+             g_state.template_id);
 
     g_state.ready = true;
     log_info("PS5 HTTP client started (SceNet/SceSsl/SceHttp2)");
@@ -158,24 +183,37 @@ static HttpResult do_request(const char *method, const HttpRequest *request,
         return HTTP_ERR_CONNECT;
     }
 
+    log_info("HTTP request starting: method=%s url=%s", method, request->url);
+    errno = 0;
     int req = sceHttp2CreateRequestWithURL(g_state.template_id, method,
                                             request->url, 0);
     if (req < 0) {
-        log_error("sceHttp2CreateRequestWithURL failed (%d) for %s", req,
-                  request->url);
+        int saved_errno = errno;
+        log_sce_error("sceHttp2CreateRequestWithURL", req, saved_errno);
+        log_error("Request creation failed for %s", request->url);
         return HTTP_ERR_CONNECT;
     }
+    log_info("sceHttp2CreateRequestWithURL succeeded: request_id=%d", req);
 
     if (request->authorization_header != NULL) {
-        if (sceHttp2AddRequestHeader(req, "Authorization",
-                                      request->authorization_header,
-                                      HTTP2_HEADER_MODE_ADD)) {
+        errno = 0;
+        int header_result = sceHttp2AddRequestHeader(
+            req, "Authorization", request->authorization_header,
+            HTTP2_HEADER_MODE_ADD);
+        if (header_result != 0) {
             /* Nonfatal here on purpose: let the server's real response
              * (almost certainly 401/403) be the source of truth about
              * whether auth actually worked, rather than assuming this
              * unverified call's failure means the whole request is dead. */
-            log_warn("sceHttp2AddRequestHeader(Authorization) failed for %s",
-                     request->url);
+            int saved_errno = errno;
+            log_warn("sceHttp2AddRequestHeader(Authorization) failed: "
+                     "rc=0x%08x (%d), errno=%d (%s), url=%s",
+                     (unsigned int)header_result, header_result, saved_errno,
+                     strerror(saved_errno), request->url);
+        } else {
+            /* Deliberately log only that the header was added. Never log
+             * the header value or the API token it contains. */
+            log_info("Authorization header added successfully");
         }
     }
 
@@ -189,29 +227,55 @@ static HttpResult do_request(const char *method, const HttpRequest *request,
             snprintf(range_header, sizeof(range_header), "bytes=%lld-",
                      (long long)request->range_start);
         }
-        if (sceHttp2AddRequestHeader(req, "Range", range_header,
-                                      HTTP2_HEADER_MODE_ADD)) {
-            log_warn("sceHttp2AddRequestHeader(Range) failed for %s",
-                     request->url);
+        errno = 0;
+        int header_result = sceHttp2AddRequestHeader(
+            req, "Range", range_header, HTTP2_HEADER_MODE_ADD);
+        if (header_result != 0) {
+            int saved_errno = errno;
+            log_warn("sceHttp2AddRequestHeader(Range) failed: rc=0x%08x "
+                     "(%d), errno=%d (%s), url=%s",
+                     (unsigned int)header_result, header_result, saved_errno,
+                     strerror(saved_errno), request->url);
+        } else {
+            log_info("Range header added successfully: %s", range_header);
         }
     }
 
-    if (sceHttp2SendRequest(req, NULL, 0)) {
-        log_error("sceHttp2SendRequest failed for %s", request->url);
+    errno = 0;
+    int send_result = sceHttp2SendRequest(req, NULL, 0);
+    if (send_result != 0) {
+        int saved_errno = errno;
+        log_sce_error("sceHttp2SendRequest", send_result, saved_errno);
+        log_error("Request send failed for %s", request->url);
         sceHttp2DeleteRequest(req);
         return HTTP_ERR_CONNECT;
     }
+    log_info("sceHttp2SendRequest succeeded for %s", request->url);
 
     int status = -1;
-    if (sceHttp2GetStatusCode(req, &status)) {
-        log_error("sceHttp2GetStatusCode failed for %s", request->url);
+    errno = 0;
+    int status_result = sceHttp2GetStatusCode(req, &status);
+    if (status_result != 0) {
+        int saved_errno = errno;
+        log_sce_error("sceHttp2GetStatusCode", status_result, saved_errno);
+        log_error("Status-code read failed for %s", request->url);
         sceHttp2DeleteRequest(req);
         return HTTP_ERR_CONNECT;
     }
+    log_info("HTTP response: status=%d url=%s", status, request->url);
 
     uint64_t content_length = 0;
-    bool have_content_length =
-        (sceHttp2GetResponseContentLength(req, &content_length) == 0);
+    errno = 0;
+    int length_result =
+        sceHttp2GetResponseContentLength(req, &content_length);
+    bool have_content_length = (length_result == 0);
+    if (!have_content_length) {
+        int saved_errno = errno;
+        log_warn("sceHttp2GetResponseContentLength failed: rc=0x%08x (%d), "
+                 "errno=%d (%s), url=%s",
+                 (unsigned int)length_result, length_result, saved_errno,
+                 strerror(saved_errno), request->url);
+    }
 
     if (response_out != NULL) {
         response_out->status_code = status;
@@ -234,14 +298,21 @@ static HttpResult do_request(const char *method, const HttpRequest *request,
     if (sink != NULL && strcmp(method, "HEAD") != 0) {
         uint8_t buf[8192];
         int n;
-        while ((n = sceHttp2ReadData(req, buf, sizeof(buf))) > 0) {
+        while (true) {
+            errno = 0;
+            n = sceHttp2ReadData(req, buf, sizeof(buf));
+            if (n <= 0) {
+                break;
+            }
             if (!sink(buf, (size_t)n, sink_user_data)) {
                 result = HTTP_ERR_CANCELLED;
                 break;
             }
         }
         if (n < 0 && result == HTTP_OK) {
-            log_error("sceHttp2ReadData failed for %s", request->url);
+            int saved_errno = errno;
+            log_sce_error("sceHttp2ReadData", n, saved_errno);
+            log_error("Response read failed for %s", request->url);
             result = HTTP_ERR_CONNECT;
         }
     }

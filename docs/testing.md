@@ -5,12 +5,64 @@ and, just as importantly, what has not — following the project rule that
 AI-generated code is untrusted until reviewed, compiled, and tested, and
 that untested functionality must never be described as working.
 
-Status as of the third hardware test (first vertical-slice UI attempt). The
-persistent-logging fan-out fix remains hardware-confirmed. The new application
-reached `video_init()` but could not allocate its fixed 64 MiB direct-memory
-block, so graphics, real `ScePad` input, networking, and RomM integration were
-not reached. See below for the exact boundary between what is and is not
-verified.
+Status as of the fourth hardware test. The direct-memory allocation fix is
+hardware-confirmed: VideoOut opened, the exact 17 MiB allocation and mapping
+succeeded, and both scanout buffers registered. The run then reached real
+ScePad and HTTPS requests. ScePad rejected the reported login user with
+`0x809b0081` (`USER_NOT_LOGIN`), while `sceHttp2SendRequest` failed before an
+HTTP status was received. The tested build did not preserve either the raw
+SceHttp2 result or `errno`; the follow-up diagnostic build does. See below for
+the exact verified boundary.
+
+## Fourth hardware test - RESULTS (video fixed, pad and HTTPS reached)
+
+Console: **CFI-1215A Z2X**. Delivery: `elfldr` over TCP port 9021. Artifact:
+the canonical CI-built `rommps5-ps5` from GitHub Actions run
+[`33913388827`](https://github.com/Crimson3076/RomM-PS5/actions/runs/33913388827)
+(commit `dfd4174`), SHA-256
+`c63b412dc9460958a646d7597a538c9ada4c793a87fa3ebda4b269e790ddbe52`.
+
+### Confirmed on physical hardware
+
+- The 17 MiB two-buffer direct-memory request succeeded. Mapping, equeue
+  creation, flip-event registration, flip rate, and
+  `sceVideoOutRegisterBuffers2` all succeeded. `video_init()` completed at
+  1920x1080. This confirms the allocation fix and the complete initialization
+  path on this console.
+- The app presented its configuration and connection screens without a logged
+  flip or wait failure. The operator has not separately confirmed the visible
+  pixel output, so this is an execution-path observation, not a claim that the
+  UI looked correct.
+- `sceUserServiceGetLoginUserIdList` returned success and one candidate user,
+  `0x15bf8af5` (`364874485`). `scePadOpen` rejected it with `0x809b0081`, the
+  public Orbis Device Service `USER_NOT_LOGIN` error. No controller handle was
+  obtained and `scePadReadState` was not reached.
+- The real config loaded from `/data/homebrew/RomM-PS5/config.json` and the
+  SceNet/SceSsl/SceHttp2 startup sequence completed. The application reached a
+  real request to the configured RomM `/api/platforms` endpoint.
+- `sceHttp2SendRequest` failed before any HTTP response status was available.
+  The tested implementation logged only a generic failure and discarded the
+  SCE result and `errno`, so this run cannot distinguish DNS, TCP, TLS,
+  certificate, or HTTP2-layer failure.
+- `sceSystemServiceHideSplashScreen` returned `0x80940004` and caused repeated
+  `SceLncUtil` warnings. VideoOut still initialized successfully, proving that
+  this LNC-only call is unnecessary for an `elfldr` payload.
+
+### Fixes prepared for the next hardware test
+
+- Removed `sceSystemServiceHideSplashScreen` and the now-unused
+  `SceSystemService` link dependency.
+- Pad startup now logs all four login slots, validates each nonnegative ID
+  through `sceUserServiceGetUserName` without logging the account name, tries
+  every candidate, checks `scePadGetHandle` after failed opens, and finally
+  tries `PAD_USER_ID_SYSTEM` once. It labels `0x809b0081` explicitly.
+- Every SceNet/SceSsl/SceHttp2 boundary now logs the full result in hexadecimal
+  and signed decimal plus `errno`. Authorization-header diagnostics never log
+  the header value or token.
+- If HTTPS still fails, test a direct LAN `http://` RomM URL next. The pinned
+  SDK's only HTTP2 sample demonstrates plain HTTP, not HTTPS, so that test will
+  separate basic networking from TLS without weakening TLS verification in the
+  app.
 
 ## Third hardware test - RESULTS (vertical-slice UI attempt)
 
@@ -32,7 +84,7 @@ the canonical CI-built `rommps5-ps5` from GitHub Actions run
 - No UI appeared. Configuration, networking, RomM access, and real controller
   input were not reached, so this test provides no evidence about them.
 
-### Fix prepared in response, not yet hardware-verified
+### Fix prepared in response, now hardware-verified
 
 - The two scanout buffers now use an overflow-checked, alignment-aware layout
   calculated from `tilemap_buffer_size()`. At 1920x1080 this requests
@@ -43,6 +95,8 @@ the canonical CI-built `rommps5-ps5` from GitHub Actions run
   include size, alignment, and memory type.
 - Host tests assert the exact 1080p and 720p tiled-buffer layouts and reject
   invalid or overflowing calculations.
+- The fourth hardware test confirmed the full initialization sequence succeeds
+  with this exact allocation layout.
 
 ## First hardware test — RESULTS (real console)
 
@@ -264,13 +318,13 @@ part of this milestone — not just written:
 | Area | What was verified |
 |---|---|
 | Host build | `cmake --build` succeeds from a clean `build/` dir, warning-free under `-Wall -Wextra -Wshadow -Wconversion -Wsign-conversion` |
-| Unit tests | `ctest` and the direct test binary both pass: 135/135 checks across path validation, download state transitions, auth-header redaction, mock RomM API search/sort/pagination, storage discovery, config load/save, and (new this milestone) persistent-log file-sink fan-out |
+| Unit tests | The current direct host test binary passes 230/230 checks across path validation, download state transitions, logging/redaction, mock and HTTP RomM APIs, storage, config/credentials, URL encoding, ZIP extraction, downloader behavior, and framebuffer layout. CI runs the same suite through `ctest`. |
 | Application smoke test | `./build/rommps5` runs under `SDL_VIDEODRIVER=dummy` for a bounded number of frames (`ROMM_PS5_SMOKE_TEST_FRAMES`) and exits 0 — proves SDL init, window/renderer creation (with software-renderer fallback, which is what actually engaged in this headless environment), the mock API load, the render loop, and clean shutdown all work without crashing |
 | Controller absence handling | Confirmed via the same smoke test: with no game controller attached, `ui_input_init` logs and falls back to keyboard input rather than failing |
 | PS5 SDK bootstrap | `ps5-payload-dev/sdk` git tag `v0.43` built from source with `clang-18`/`lld-18` and `make DESTDIR=/opt/ps5-payload-sdk install` completed with no errors (a handful of pre-existing warnings inside the SDK's own `libc`/`libufs` code, not this project's) |
 | PS5 SDK toolchain sample | The SDK's own `samples/hello_world` built against that install and produced a valid `ELF 64-bit LSB pie executable, x86-64` |
 | `rommps5_core` for PS5 | Compiles **unchanged** (same source, same CMake target) against the pinned SDK: `pathval`, `download`, `log`, `config`, `storage`, `net`'s null client, `romm_api_mock`, `mockdata` — see `docs/building.md` |
-| PS5 ELF build | `src/ps5/main_ps5.c` compiles and links against the pinned SDK, `-Wall -Wextra -Wshadow -Wconversion -Wsign-conversion` warning-clean, producing a real PS5 ELF with correct `NEEDED .sprx` entries for `libSceUserService`, `libSceNotification`, `libkernel_sys`, `libScePad`, `libSceLibcInternal`, `libSceNet` |
+| PS5 ELF build | The complete vertical slice compiles and links against the pinned SDK under `-Wall -Wextra -Wshadow -Wconversion -Wsign-conversion`, producing a PS5 ELF using UserService, Pad, VideoOut, Net, SSL, and Http2. Each published nightly artifact is verified by `file`, `readelf`, and `sha256sum` in CI. |
 | GitHub Actions (both jobs) | `host-build-test` and `ps5-cross-compile` both ran for real on `ubuntu-24.04` GitHub-hosted runners and completed with `conclusion: success` — confirmed by reading the actual job logs (real `prospero-clang` invocations, real `readelf`/`sha256sum` output, real test pass, real artifact upload), not just the run's top-level status. |
 
 **CI run for this milestone's fixes**: run
@@ -295,69 +349,48 @@ paths. A future improvement (not done this milestone) would be to add
 the checksum of the specific artifact you actually have, not a
 different-environment build's — they are legitimately different files.
 
-## What is mocked, not real
+## What remains mocked or host-only
 
-- **RomM connectivity**: `romm_api_mock_init()` is the only backend wired
-  into the app. It returns a fixed, fictional 8-game fixture
-  (`src/mockdata/mock_library.c`) — no network call happens anywhere in
-  this milestone. A real HTTP-backed `RommApi` implementation is deferred
-  until the network/TLS spike described in `docs/architecture.md` §1 is
-  resolved.
-- **HTTP transport**: `http_client_null_init()` is the only `HttpClient`
-  implementation, and every call returns `HTTP_ERR_UNIMPLEMENTED`. It
-  exists only so the interface shape can be written and compiled against
-  now.
-- **Downloads**: `DownloadProgress`/`download_progress_*` implement only
-  the state machine and byte counters — no file is ever written, no bytes
-  are ever transferred. There is no archive extractor yet.
-- **Config**: persisted fields are limited to non-credential UI state
-  (`selected_destination_index`, `fullscreen`). No RomM server URL or
-  token is stored anywhere by this milestone's code, and a unit test
-  (`test_config.c`) asserts the saved file never contains the strings
-  `token`, `rmm_`, or `url`, specifically to catch a future regression
-  here.
+- The desktop SDL application still uses `romm_api_mock_init()` and its
+  fictional eight-game fixture. That keeps desktop UI smoke tests independent
+  of a real server.
+- The PS5 target does not use the mock backend. It loads real credentials,
+  instantiates `http_client_ps5`, and uses `romm_api_http` plus the real
+  downloader and ZIP extractor.
+- Host unit tests use `mock_http_client` to exercise API parsing, fresh and
+  resumed downloads, cancellation, storage refusal, and extraction without
+  making external requests. These tests validate application logic, not SCE
+  networking behavior.
 
 ## What has NOT been tested at all
 
-- **Real `ScePad` behavior, still entirely unknown.** Both hardware tests
-  confirm `scePadOpen` is correctly *skipped* (see "Second hardware test"
-  above) — that is not the same as it being tested. Whether any path to a
-  real, verified user id (and therefore `scePadOpen`) exists at all
-  remains a completely open question, and `scePadReadState` (actual
-  button/stick state) is still never called at all — deliberately
-  deferred; see `docs/building.md` "Input mapping". `scePadInit()` itself
-  is now observed to return `0x0 (0)` on this one console (second
-  hardware test), which is the only real ScePad-adjacent data point that
-  exists.
+- **Usable real `ScePad` input.** The fourth hardware test reached
+  `scePadOpen`, but the first user returned by UserService was rejected as
+  `USER_NOT_LOGIN`. No valid handle was obtained, so `scePadReadState` and
+  actual buttons remain unverified. The next build tests every returned user
+  and checks for an existing handle.
   - DualSense input via the host-only `SDL_GameController` path is
     irrelevant to the PS5 target (it's host-build-only, see
     `docs/building.md`) and remains desktop-only-tested regardless.
   - PS5 firmware version/compatibility beyond "targets 10.60" per the
     project's stated scope — this milestone's console is one data point,
     not a compatibility sweep.
-- **Real RomM server integration.** No live RomM instance was reachable
-  from this environment; the API endpoint/behavior findings in
-  `docs/architecture.md` §3 come from reading RomM's own backend source,
-  not from an end-to-end HTTP exchange. Authentication, real pagination,
-  cover art, and both download code paths (live-stream and
-  Range-triggered cache-build) are all still unverified against a running
-  server.
-- **Large files / large libraries.** The mock fixture has 8 entries and no
-  file ever moves; nothing here says anything about behavior at the scale
-  the task requires (100+ GB single files, large real libraries).
-- **Any filesystem write of a game file.** `storage_discover()`'s
-  read-only discovery has now been confirmed against a real fixed
-  candidate path on real hardware (`/data/etaHEN/games`, see "First
-  hardware test" above) as well as temp directories in host tests (see
-  `tests/test_storage.c`). No code anywhere in this project writes a game
-  file (or any large file) to a destination — that's still entirely
-  unbuilt.
-- **GitHub Actions CI itself.** `.github/workflows/build.yml` now has two
-  jobs, `host-build-test` and `ps5-cross-compile`; both were written to
-  mirror exactly the commands verified locally (see above). See this
-  milestone's session report for the actual observed run status — do not
-  trust either job as a gate until you've confirmed its current status
-  yourself, since a workflow file can drift from what actually ran.
+- **A successful real RomM response.** The fourth test loaded the real config,
+  initialized the console network libraries, and attempted `/api/platforms`,
+  but `sceHttp2SendRequest` failed before a status was returned. Authentication,
+  pagination, and response parsing therefore remain unverified on hardware.
+- **Any on-console download or extraction.** Those paths are implemented and
+  host-tested but cannot run until the initial RomM request succeeds. No game
+  data has been written by this app on a PS5.
+- **Large files and large libraries on hardware.** Host tests cover bounded
+  synthetic data only. Nothing yet proves behavior for 100+ GB files or a
+  large real library on the console.
+- **Visible UI correctness.** The fourth run completed VideoOut initialization
+  and invoked screen presentation without logged errors. The operator has not
+  yet reported whether the pixels, colors, text, or tiled layout appeared
+  correctly on the display.
+- **Other consoles or firmware versions.** Current hardware evidence is from
+  one CFI-1215A Z2X.
 
 ## Hardware test checklist
 

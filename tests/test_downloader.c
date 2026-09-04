@@ -5,22 +5,10 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-static void mkdir_p(const char *path) {
-    char tmp[512];
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    for (char *p = tmp + 1; *p != '\0'; p++) {
-        if (*p == '/') {
-            *p = '\0';
-            mkdir(tmp, 0700);
-            *p = '/';
-        }
-    }
-    mkdir(tmp, 0700);
-}
 
 static bool file_exists(const char *path) {
     struct stat st;
@@ -45,10 +33,14 @@ static bool cancel_after_first_chunk(void *user_data) {
 }
 
 void test_downloader(TestCounters *tc) {
-    char dest_root[80];
-    snprintf(dest_root, sizeof(dest_root), "/tmp/rommps5_test_dl_%d",
-              getpid());
-    mkdir_p(dest_root);
+    /* Sandboxed runners can reuse a PID while retaining /tmp. A unique
+     * directory keeps repeated test invocations independent instead of
+     * resuming or extracting over a previous run's output. */
+    char dest_root[] = "/tmp/rommps5_test_dl_XXXXXX";
+    if (mkdtemp(dest_root) == NULL) {
+        TEST_CHECK(tc, false);
+        return;
+    }
 
     /* --- Fresh single-file download, success --- */
     {

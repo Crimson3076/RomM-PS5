@@ -17,9 +17,9 @@
  * directly (besides the small, already-verified SceUserService lifecycle
  * pair and sceKernelGetHwModelName kept from the earlier milestone).
  *
- * Compiled for PS5 and NOT yet run on real hardware as of this commit —
- * see the handoff report / docs/testing.md for exactly what that means
- * and what physical verification is still required.
+ * This path has run on a real CFI-1215A Z2X through VideoOut setup,
+ * UserService/Pad startup, config loading, and a real HTTPS send attempt.
+ * See docs/testing.md for the precise current verification boundary.
  */
 #include "config/credentials.h"
 #include "download/download_manager.h"

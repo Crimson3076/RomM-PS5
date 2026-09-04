@@ -221,14 +221,14 @@ the "RomM-PS5" toast notification appears on screen, log lines relay live
 over the `elfldr` TCP connection, `/data/romm-ps5/ps5-hello.log` is
 created and retrievable, `storage_discover()` correctly finds
 `/data/etaHEN/games` with real free-space numbers, and the process exits
-cleanly. **Found broken** by that same test, and addressed (but not yet
-retested) in a later milestone: the persistent log file was missing
-several lines that appeared over TCP, and `sceUserServiceGetInitialUser`
-(used to try to get a real user id for `ScePadOpen`) failed — investigated
-and found to be an undocumented call in this SDK, not something this
-project can safely fix by guessing; see `docs/testing.md` for the full
-writeup. Real controller input (`ScePadOpen`/`ScePadReadState`) has never
-been reached at all and remains completely unverified.
+cleanly. **Found broken** by that same test: the persistent log file was
+missing several lines that appeared over TCP, and
+`sceUserServiceGetInitialUser` failed. The logging defect is fixed and
+hardware-confirmed. The app now uses the maintained PS5 SDL port's
+`sceUserServiceGetLoginUserIdList` path. A later hardware run reached
+`scePadOpen`, but Device Service rejected the returned user as
+`USER_NOT_LOGIN`; no usable controller handle or input read has been
+confirmed. See `docs/testing.md` for the complete results.
 
 ## Input mapping
 
@@ -237,17 +237,12 @@ Two separate, non-overlapping input paths exist, matching the two targets:
 - **Host (SDL2)**: `SDL_GameController` (D-Pad up/down/left/right for
   navigation, Cross for confirm, Circle for cancel) — see `src/ui/input.c`.
   Exercised on desktop only; not used by the PS5 target at all.
-- **PS5 (native ScePad)**: `src/ps5/main_ps5.c` links `libScePad.sprx` and
-  calls `scePadInit` unconditionally (it takes no arguments, so there is
-  nothing about its call shape to guess). `scePadOpen`/`scePadClose` are
-  real, confirmed-exported symbols in the pinned SDK too, but as of this
-  milestone they are **never actually called**: they require a real user
-  id, and the first hardware test showed this SDK provides no verified way
-  to obtain one (`sceUserServiceGetInitialUser` is undocumented by this
-  SDK and failed on real hardware) — see `docs/testing.md`'s
-  "SceUserService/ScePad" sections for the full investigation. This is a
-  documented blocker, not a design choice: real controller input on PS5
-  doesn't work yet, at all, pending either an authoritative reference for
-  SceUserService's real ABI or a different way to reach a real user
-  context. `scePadReadState` remains deliberately uncalled regardless —
-  its output struct layout is not published anywhere in this SDK either.
+- **PS5 (native ScePad)**: `src/ps5/pad.c` uses the function signatures and
+  pad-state layout from the maintained `ps5-payload-dev/SDL` PS5 backend.
+  Hardware confirms `scePadInit` and
+  `sceUserServiceGetLoginUserIdList` succeed, but the first ID returned to
+  this raw `elfldr` payload was rejected by `scePadOpen` with
+  `0x809b0081` (`USER_NOT_LOGIN`). The next diagnostic build validates and
+  tries every returned ID plus any existing handle. Until one succeeds,
+  actual `scePadReadState` button input remains unverified and the app is
+  not yet controllable.

@@ -21,7 +21,9 @@
  * falls back to `PAD_USER_ID_SYSTEM` if no user is logged in, rather than
  * refusing to open a pad at all.
  *
- * Compiled for PS5 and NOT yet run on real hardware — see docs/testing.md.
+ * The initialization and first open attempt have run on real hardware.
+ * No usable handle or input read has been confirmed yet; see
+ * docs/testing.md.
  */
 #ifndef ROMM_PS5_PAD_H
 #define ROMM_PS5_PAD_H
@@ -36,6 +38,9 @@ extern "C" {
 #define PAD_PORT_TYPE_STANDARD 0
 #define PAD_USER_ID_SYSTEM 0xff
 #define PAD_ERROR_ALREADY_OPENED 0x80920004u
+/* Observed on hardware and decoded by public Orbis Device Service error
+ * tables. This is not one of the ScePad-local 0x8092xxxx errors. */
+#define PAD_ERROR_USER_NOT_LOGIN 0x809b0081u
 
 #define PAD_BUTTON_L3 0x0002
 #define PAD_BUTTON_R3 0x0004
@@ -119,12 +124,12 @@ typedef struct {
  * the underlying call reported success. */
 bool pad_init(PadState *state);
 
-/* Resolves a real logged-in user id via sceUserServiceGetLoginUserIdList
- * and opens a standard controller handle for it with scePadOpen(). Falls
- * back to PAD_USER_ID_SYSTEM if no user is logged in. Returns true and
- * fills state->handle/user_id on success (including the documented
- * "already opened" condition, PAD_ERROR_ALREADY_OPENED, which this
- * treats as success rather than an error — the pad IS open either way). */
+/* Enumerates every user id returned by
+ * sceUserServiceGetLoginUserIdList and tries to obtain a standard
+ * controller handle for each one. It also checks scePadGetHandle after
+ * an open failure in case the pad is already owned by the system. Falls
+ * back to PAD_USER_ID_SYSTEM only if none of the reported users works.
+ * Returns true and fills state->handle/user_id on success. */
 bool pad_open(PadState *state);
 
 /* Reads the current controller state into *out. Returns false (and

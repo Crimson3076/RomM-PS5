@@ -8,6 +8,33 @@ so far is unreleased `nightly` development.
 
 ## [Unreleased]
 
+### Fourth hardware test - video confirmed, pad and HTTPS diagnostics
+
+The CI artifact from commit `dfd4174` reached the complete VideoOut path,
+ScePad startup, config loading, and a real RomM HTTPS request on a CFI-1215A
+Z2X.
+
+- Hardware-confirmed the 17 MiB framebuffer allocation fix through direct-memory
+  allocation, mapping, equeue creation, flip-event setup, flip rate, and
+  two-buffer registration at 1920x1080.
+- Removed `sceSystemServiceHideSplashScreen`. Raw `elfldr` payloads are not
+  LNC-managed applications; the call returned `0x80940004`, generated repeated
+  system warnings, and was not required for VideoOut to work. Removed the
+  unused `SceSystemService` link dependency too.
+- `scePadOpen` reached hardware for the first time but rejected the first
+  reported user ID with `0x809b0081` (`USER_NOT_LOGIN`). Pad startup now logs
+  and validates all reported candidates, tries each one, checks for an existing
+  handle after open failures, and performs one system-user fallback attempt.
+- `sceHttp2SendRequest` reached hardware for the first time but failed before
+  an HTTP status was returned. Added raw hexadecimal/decimal SCE results and
+  `errno` logging across network startup, request creation, header addition,
+  send, status, length, and body reads. Authorization values and API tokens are
+  never logged.
+- Made ZIP-extractor and downloader tests safe to rerun in sandboxed
+  environments that reuse process IDs while retaining `/tmp`; each run now
+  creates a unique destination directory instead of colliding with prior test
+  output.
+
 ### Third hardware test - video direct-memory allocation fix
 
 The first vertical-slice artifact reached `video_init()` on a CFI-1215A Z2X
@@ -22,8 +49,8 @@ controller, networking, or RomM behavior could be tested.
   cases.
 - Added return-code, `errno`, requested-size, alignment, and stage-success
   diagnostics throughout PS5 video initialization.
-- This fix is compiled and host-tested but still requires a physical hardware
-  retest before video output can be described as working.
+- The fourth hardware test confirmed this fix through successful buffer
+  registration and completion of `video_init()`.
 
 ### Second hardware test — logging fix confirmed
 
