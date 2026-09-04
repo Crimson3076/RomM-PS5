@@ -155,7 +155,16 @@ part of this milestone — not just written:
 | PS5 SDK toolchain sample | The SDK's own `samples/hello_world` built against that install and produced a valid `ELF 64-bit LSB pie executable, x86-64` |
 | `rommps5_core` for PS5 | Compiles **unchanged** (same source, same CMake target) against the pinned SDK: `pathval`, `download`, `log`, `config`, `storage`, `net`'s null client, `romm_api_mock`, `mockdata` — see `docs/building.md` |
 | PS5 ELF build | `src/ps5/main_ps5.c` compiles and links against the pinned SDK, `-Wall -Wextra -Wshadow -Wconversion -Wsign-conversion` warning-clean, producing a real PS5 ELF with correct `NEEDED .sprx` entries for `libSceUserService`, `libSceNotification`, `libkernel_sys`, `libScePad`, `libSceLibcInternal`, `libSceNet` |
-| GitHub Actions (both jobs) | `host-build-test` and `ps5-cross-compile` both ran for real on `ubuntu-24.04` GitHub-hosted runners and completed with `conclusion: success` — confirmed by reading the actual job logs (real `prospero-clang` invocations, real `readelf`/`sha256sum` output, real 115-check test pass, real artifact upload), not just the run's top-level status. See this milestone's session report for the run URL and IDs. |
+| GitHub Actions (both jobs) | `host-build-test` and `ps5-cross-compile` both ran for real on `ubuntu-24.04` GitHub-hosted runners and completed with `conclusion: success` — confirmed by reading the actual job logs (real `prospero-clang` invocations, real `readelf`/`sha256sum` output, real test pass, real artifact upload), not just the run's top-level status. |
+
+**CI run for this milestone's fixes**: run
+[`33905275501`](https://github.com/Crimson3076/RomM-PS5/actions/runs/33905275501)
+(commit `69bc48c`), both jobs `success`, verified via job logs (135-check
+test pass logged, real `readelf`/`sha256sum` output). CI-built
+`rommps5-ps5` SHA-256: `9f5ea26cba4f6d4818158d774d7fd8fa59a6a1368094e17af82492368bacf8e9`
+(differs from any locally-built copy — see the reproducibility caveat
+below; this is the canonical artifact, downloadable from that run as
+`rommps5-ps5-nightly-69bc48cd6725343314357ffb47f9fe331fc5ae8a`).
 
 **Reproducibility caveat found this milestone**: two clean *local* builds
 produced byte-identical SHA-256 output, but the CI-built ELF's SHA-256
