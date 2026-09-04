@@ -1,5 +1,6 @@
 # Build output
 build/
+build-ps5/
 out/
 bin/
 *.o
@@ -9,6 +10,7 @@ bin/
 *.sprx
 *.a
 *.so
+ps5-elf-sha256.txt
 
 # ps5-payload-sdk / toolchain
 .ps5-payload-sdk/

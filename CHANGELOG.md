@@ -8,6 +8,37 @@ so far is unreleased `nightly` development.
 
 ## [Unreleased]
 
+### PS5 cross-compilation milestone
+
+- Bootstrapped `ps5-payload-dev/sdk`, pinned to git tag `v0.43`, built from
+  source with `clang-18`/`lld-18` — not the project's `main` branch or its
+  prebuilt release zip, to keep the toolchain reproducible and free of
+  unexplained binaries.
+- Fixed a real CMake toolchain bug: the PS5 toolchain must be supplied via
+  `-DCMAKE_TOOLCHAIN_FILE=...` on the configure command line, not
+  `include()`d from inside `CMakeLists.txt` — the latter silently kept
+  using the host compiler. Target detection now checks `PROSPERO` (set by
+  the SDK's own `toolchain/prospero.cmake`) instead of a hand-rolled cache
+  variable.
+- Added `src/ps5/main_ps5.c`, a PS5-native entry point (no SDL) that
+  initializes UserService, logs via this project's own `log` module, reads
+  the console's hardware model name, runs `storage_discover()` against the
+  real fixed destination list, sends an on-screen notification toast, and
+  opens (but does not read from) a real `ScePad` controller handle.
+- Confirmed `rommps5_core` (`pathval`, `download`, `log`, `config`,
+  `storage`, `net`'s null client, `romm_api_mock`, `mockdata`) compiles
+  **unchanged** for the PS5 target — same source, same CMake target.
+- Corrected the Milestone 0 assumption that `ps5-payload-dev/SDL` was a
+  ready rendering path: the pinned SDK's own sample set has no SDL example
+  and doesn't reference that port at all. SDL stays strictly host-only;
+  the PS5 target uses the SDK's own real approach (`SceNotification`,
+  `ScePad`, `SceUserService`) instead. See `docs/architecture.md` §5a.
+- Added a `ps5-cross-compile` CI job that bootstraps the pinned SDK and
+  builds `build-ps5/rommps5-ps5`, uploaded as a workflow artifact (not a
+  release).
+- Updated `docs/building.md` and `docs/testing.md` with exact, verified
+  commands and an explicit list of what still requires real PS5 hardware.
+
 ### Milestone 1 — Application foundation
 
 - Added a CMake-based project structure separating the codebase into

@@ -350,6 +350,75 @@ never silently corrupt a partial extraction.
 
 ---
 
+## 5a. PS5 cross-compilation milestone — SDL corrected, real toolchain verified
+
+This section supersedes the SDL-related claims in §1 above ("Rendering
+surface for UI: **Available**" via `ps5-payload-dev/SDL`) with what was
+actually found when the toolchain was bootstrapped for real.
+
+- **The SDK was bootstrapped and pinned.** `ps5-payload-dev/sdk` git tag
+  `v0.43` was cloned and built from source with `clang-18`/`lld-18`
+  (`make DESTDIR=/opt/ps5-payload-sdk install`), and its own
+  `samples/hello_world` was built and confirmed to produce a valid PS5 ELF
+  against that install. See `docs/building.md` for exact, tested commands.
+- **SDL is not part of the SDK, and no sample uses it.** The SDK's own
+  `samples/` directory (23 samples as of `v0.43`: `hello_world`,
+  `hello_cxx`, `hwinfo`, `notify`, `browser`, `install_app`, etc.) contains
+  **no SDL example**, and `ps5-payload-dev/SDL` (the separate SDL2 port
+  identified in §1) is not referenced by, bundled with, or built by this
+  SDK. §1's "Available" rating for SDL rendering was based on that port's
+  existence in the `ps5-payload-dev` GitHub organization, not on it being
+  proven to build against this SDK — that gap is now closed by direct
+  observation, and the honest answer is: **still unverified, and not
+  pursued this milestone.**
+- **The real, maintained-in-this-SDK approach for "show something on
+  screen" is a system notification toast**, via `sceNotificationSend`
+  (`libSceNotification.sprx`) — this is exactly what the SDK's own
+  `samples/notify/main.c` (contributed 2025, credited to LightningMods —
+  the same author named in this project's own target-environment
+  description) does, and what this project's PS5 target
+  (`src/ps5/main_ps5.c`) now does too. It is a real, visible, on-screen
+  result, just not a custom-rendered UI screen.
+- **Controller input is architecturally real but only partially usable
+  yet.** `sce_stubs/libScePad.so` in the pinned SDK genuinely exports
+  `scePadInit`, `scePadOpen`, `scePadReadState`, `scePadClose`, and 126
+  other `scePad*` symbols — confirmed by inspecting the stub library
+  directly, not inferred. However, unlike `sceNotificationSend` (whose
+  exact signature came from the SDK's own sample source), **none of the
+  ScePad function signatures or the `ScePadData` output struct's field
+  layout are published anywhere in this SDK.** `main_ps5.c` calls
+  `scePadInit`/`scePadOpen`/`scePadClose` (scalar arguments only, following
+  the widely-published PS4/PS5 homebrew convention) to prove real linkage
+  and obtain a real pad handle, but deliberately does **not** call
+  `scePadReadState` — passing a hand-typed, unverified struct to a
+  kernel-adjacent call that likely writes into it based on an assumed size
+  is a real crash risk this project has no way to check without hardware.
+  Reading actual button/stick state is deferred to a future milestone,
+  once that struct layout can be sourced from a trustworthy reference and
+  confirmed on real hardware.
+- **GNM (the PS4/PS5 GPU driver, `libSceGnmDriver.so`) was not
+  attempted.** It is present as a real stub in the SDK (confirming raw
+  framebuffer/GPU access is *architecturally* possible), but no sample in
+  this SDK demonstrates using it, it is known to be complex and largely
+  undocumented for homebrew, and attempting it without a working reference
+  would risk producing something that looks like real rendering but isn't
+  verified — exactly the "fake platform stub" this project's own
+  instructions say not to produce. Left as a genuinely open research item
+  for whenever a real custom-rendered UI on PS5 is prioritized.
+- **Practical consequence for this project's architecture**: the PS5
+  target has no UI/rendering module at all right now, by design — see
+  `CMakeLists.txt` and `docs/building.md`. `rommps5_ui` (SDL) remains
+  strictly host-only. When real on-console UI is prioritized, the two
+  live options based on actual findings are (a) invest in verifying
+  `ps5-payload-dev/SDL` against this exact SDK from first principles, or
+  (b) build a UI out of a sequence of `sceNotificationSend` toasts plus
+  whatever `SceSystemService`/`SceImeDialog`-style system UI primitives
+  the stub set exposes (`libSceImeDialog.so` is present, for example) —
+  neither has been evaluated in depth; this is a decision for a future
+  milestone, not one made here.
+
+---
+
 ## 6. Open risks carried into Milestone 1/2
 
 1. **Network+TLS stack on PS5 is unproven.** No confirmed working port of

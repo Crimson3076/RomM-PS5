@@ -1,11 +1,16 @@
-name: Build and test (host)
+name: Build and test
 
-# Builds and tests only the "host" target (see CMakeLists.txt). The PS5
-# cross-compilation target requires the ps5-payload-dev/sdk toolchain,
-# which is not available in GitHub-hosted runners and has not yet been
-# verified anywhere in this project — see docs/architecture.md and
-# docs/building.md. This workflow exists to keep the host build and unit
-# tests from silently rotting, not to validate PS5 hardware compatibility.
+# Two independent jobs:
+#   host-build-test    - builds the SDL2 UI + runs the full unit test suite.
+#   ps5-cross-compile  - bootstraps the pinned ps5-payload-dev/sdk from
+#                        source and cross-compiles the PS5-native ELF
+#                        (src/ps5/main_ps5.c). Uploads the ELF as a workflow
+#                        artifact only — this workflow never creates or
+#                        publishes a GitHub release.
+#
+# PS5_SDK_REF pins the exact ps5-payload-dev/sdk version this project
+# builds against. Bump it deliberately (and re-verify docs/testing.md)
+# rather than tracking that project's default branch.
 
 on:
   push:
@@ -13,6 +18,10 @@ on:
   pull_request:
     branches: [nightly, main]
   workflow_dispatch:
+
+env:
+  PS5_SDK_REPO: ps5-payload-dev/sdk
+  PS5_SDK_REF: v0.43
 
 jobs:
   host-build-test:
@@ -40,3 +49,58 @@ jobs:
           SDL_AUDIODRIVER: dummy
           ROMM_PS5_SMOKE_TEST_FRAMES: "30"
         run: ./build/rommps5
+
+  ps5-cross-compile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PS5 SDK build dependencies
+        # Matches ps5-payload-dev/sdk's own documented Debian prerequisites
+        # (README.md "Prerequisites") — clang-18/lld-18 are the versions
+        # that project's CI pins to as of PS5_SDK_REF.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake bash clang-18 lld-18 wget
+
+      - name: Cache built PS5 SDK
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/ps5-payload-sdk
+          key: ps5-payload-sdk-${{ env.PS5_SDK_REF }}-clang18-${{ runner.os }}
+
+      - name: Bootstrap ps5-payload-dev/sdk (pinned)
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch "${PS5_SDK_REF}" --depth 1 \
+            "https://github.com/${PS5_SDK_REPO}.git" /tmp/ps5-sdk-src
+          cd /tmp/ps5-sdk-src
+          git rev-parse HEAD
+          sudo make -j1 DESTDIR=/opt/ps5-payload-sdk install
+
+      - name: Configure (PS5 target)
+        env:
+          PS5_PAYLOAD_SDK: /opt/ps5-payload-sdk
+        run: |
+          cmake -S . -B build-ps5 \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/ps5-payload-toolchain.cmake"
+
+      - name: Build (PS5 target)
+        run: cmake --build build-ps5 --parallel
+
+      - name: Verify ELF and print checksum
+        run: |
+          file build-ps5/rommps5-ps5
+          readelf -h build-ps5/rommps5-ps5
+          sha256sum build-ps5/rommps5-ps5 | tee ps5-elf-sha256.txt
+
+      - name: Upload PS5 ELF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rommps5-ps5-nightly-${{ github.sha }}
+          path: |
+            build-ps5/rommps5-ps5
+            ps5-elf-sha256.txt
+          retention-days: 14
+          if-no-files-found: error
