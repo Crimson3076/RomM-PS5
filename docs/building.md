@@ -211,19 +211,24 @@ export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 "$PS5_PAYLOAD_SDK/bin/prospero-deploy" -h 192.168.0.180 -p 9021 build-ps5/rommps5-ps5
 ```
 
-### What running it should do — and what's unverified
+### What running it should do — and what's confirmed vs. still unverified
 
-Per `src/ps5/main_ps5.c`'s own header comment: on success it should show a
-"RomM-PS5" toast notification on screen, write log lines to both the
-elfldr TCP connection (stdout/stderr — visible live in the terminal running
-`socat`/`prospero-deploy`, since elfldr relays a launched payload's
-stdio back over the same connection) and to `/data/romm-ps5/ps5-hello.log`
-on the console's own storage, then exit cleanly (return 0) after closing
-that log file and tearing down UserService. **None of this has been
-observed on real hardware** — see `docs/testing.md` for the itemized list
-of what's confirmed (compiles, links, real SCE library symbols) versus
-what still needs a console (does it actually run, does the notification
-appear, is `/data` writable and is `ScePadOpen`'s handle actually valid).
+This has now been run once on real hardware (console CFI-1215A Z2X, via
+`elfldr` over port 9021) — see `docs/testing.md` "First hardware test" for
+the full results, exact observed output, and what changed since. Briefly:
+**confirmed** on that test: the ELF runs to completion without crashing,
+the "RomM-PS5" toast notification appears on screen, log lines relay live
+over the `elfldr` TCP connection, `/data/romm-ps5/ps5-hello.log` is
+created and retrievable, `storage_discover()` correctly finds
+`/data/etaHEN/games` with real free-space numbers, and the process exits
+cleanly. **Found broken** by that same test, and addressed (but not yet
+retested) in a later milestone: the persistent log file was missing
+several lines that appeared over TCP, and `sceUserServiceGetInitialUser`
+(used to try to get a real user id for `ScePadOpen`) failed — investigated
+and found to be an undocumented call in this SDK, not something this
+project can safely fix by guessing; see `docs/testing.md` for the full
+writeup. Real controller input (`ScePadOpen`/`ScePadReadState`) has never
+been reached at all and remains completely unverified.
 
 ## Input mapping
 
@@ -233,11 +238,16 @@ Two separate, non-overlapping input paths exist, matching the two targets:
   navigation, Cross for confirm, Circle for cancel) — see `src/ui/input.c`.
   Exercised on desktop only; not used by the PS5 target at all.
 - **PS5 (native ScePad)**: `src/ps5/main_ps5.c` links `libScePad.sprx` and
-  calls `scePadInit`/`scePadOpen`/`scePadClose` directly — real, confirmed-
-  exported symbols in the pinned SDK, using the widely-published PS4/PS5
-  homebrew call convention (not documented by this SDK itself). It
-  deliberately stops at opening a handle: `scePadReadState`'s output struct
-  layout is not published anywhere in this SDK, and passing a wrong struct
-  size to it is a real crash risk that cannot be checked without hardware.
-  Actual button/stick reading is deferred to a future milestone, once that
-  struct layout can be verified. See `docs/testing.md`.
+  calls `scePadInit` unconditionally (it takes no arguments, so there is
+  nothing about its call shape to guess). `scePadOpen`/`scePadClose` are
+  real, confirmed-exported symbols in the pinned SDK too, but as of this
+  milestone they are **never actually called**: they require a real user
+  id, and the first hardware test showed this SDK provides no verified way
+  to obtain one (`sceUserServiceGetInitialUser` is undocumented by this
+  SDK and failed on real hardware) — see `docs/testing.md`'s
+  "SceUserService/ScePad" sections for the full investigation. This is a
+  documented blocker, not a design choice: real controller input on PS5
+  doesn't work yet, at all, pending either an authoritative reference for
+  SceUserService's real ABI or a different way to reach a real user
+  context. `scePadReadState` remains deliberately uncalled regardless —
+  its output struct layout is not published anywhere in this SDK either.

@@ -8,6 +8,7 @@ void test_log_redact(TestCounters *tc);
 void test_romm_api_mock(TestCounters *tc);
 void test_storage(TestCounters *tc);
 void test_config(TestCounters *tc);
+void test_log_file_sink(TestCounters *tc);
 
 typedef struct {
     const char *name;
@@ -22,6 +23,7 @@ int main(void) {
         {"romm_api_mock", test_romm_api_mock},
         {"storage", test_storage},
         {"config", test_config},
+        {"log_file_sink", test_log_file_sink},
     };
     size_t test_count = sizeof(tests) / sizeof(tests[0]);
 

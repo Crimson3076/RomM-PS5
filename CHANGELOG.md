@@ -8,6 +8,41 @@ so far is unreleased `nightly` development.
 
 ## [Unreleased]
 
+### First hardware test, and fixes in response
+
+The PS5 cross-compilation milestone's artifact was run on real hardware for
+the first time (console CFI-1215A Z2X, via `elfldr`) — see
+`docs/testing.md` "First hardware test" for full results. It ran to
+completion, the notification appeared, TCP logging worked, and
+`storage_discover()` correctly found a real destination — but
+`sceUserServiceGetInitialUser` failed, and the persistent log file was
+missing several lines that appeared over TCP. Fixes below address both;
+**neither has been hardware-verified yet** — see `docs/testing.md`.
+
+- Investigated the pinned SDK directly (every sample, every `sce_stubs`
+  file, the full `include/` tree) and confirmed
+  `sceUserServiceGetInitialUser` is undocumented anywhere in it — no
+  sample, header, or constant. The previous signature was sourced from
+  general homebrew convention, not this SDK, and the hardware failure is
+  real evidence it shouldn't be trusted. Per this project's policy against
+  guessing undocumented ABI, `src/ps5/main_ps5.c` no longer calls it;
+  `scePadOpen` (which needs a real user id) is skipped and logged as a
+  documented blocker instead of an attempted-and-failed guess.
+  `scePadInit()` (no arguments, nothing to guess) is still called.
+- `sceUserServiceInitialize`/`sceNotificationSend`/`scePadInit` results are
+  now always logged in both hex and signed decimal.
+  `sceUserServiceTerminate` is now only called if initialize actually
+  succeeded.
+- Consolidated all application logging behind `src/log/log.c`: added an
+  optional persistent-file sink (`log_init_file_sink`/
+  `log_close_file_sink`) that every `log_message()` call fans out to
+  automatically, flushed per line. Removed `main_ps5.c`'s hand-rolled
+  duplicate-logging helper, which was the root cause of the missing lines
+  — it required every call site to remember a second function call, and
+  two didn't. Added `tests/test_log_file_sink.c` (20 checks: fan-out,
+  no duplication, failed-sink nonfatality, pre-close flush durability).
+- Applied `.clang-format` to every file touched this round.
+
 ### PS5 cross-compilation milestone
 
 - Bootstrapped `ps5-payload-dev/sdk`, pinned to git tag `v0.43`, built from
