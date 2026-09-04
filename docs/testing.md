@@ -23,7 +23,21 @@ part of this milestone — not just written:
 | PS5 SDK bootstrap | `ps5-payload-dev/sdk` git tag `v0.43` built from source with `clang-18`/`lld-18` and `make DESTDIR=/opt/ps5-payload-sdk install` completed with no errors (a handful of pre-existing warnings inside the SDK's own `libc`/`libufs` code, not this project's) |
 | PS5 SDK toolchain sample | The SDK's own `samples/hello_world` built against that install and produced a valid `ELF 64-bit LSB pie executable, x86-64` |
 | `rommps5_core` for PS5 | Compiles **unchanged** (same source, same CMake target) against the pinned SDK: `pathval`, `download`, `log`, `config`, `storage`, `net`'s null client, `romm_api_mock`, `mockdata` — see `docs/building.md` |
-| PS5 ELF build | `src/ps5/main_ps5.c` compiles and links against the pinned SDK, `-Wall -Wextra -Wshadow -Wconversion -Wsign-conversion` warning-clean, producing a real PS5 ELF with correct `NEEDED .sprx` entries for `libSceUserService`, `libSceNotification`, `libkernel_sys`, `libScePad`, `libSceLibcInternal`, `libSceNet` — reproducible: two independent clean builds produced byte-identical SHA-256 output |
+| PS5 ELF build | `src/ps5/main_ps5.c` compiles and links against the pinned SDK, `-Wall -Wextra -Wshadow -Wconversion -Wsign-conversion` warning-clean, producing a real PS5 ELF with correct `NEEDED .sprx` entries for `libSceUserService`, `libSceNotification`, `libkernel_sys`, `libScePad`, `libSceLibcInternal`, `libSceNet` |
+| GitHub Actions (both jobs) | `host-build-test` and `ps5-cross-compile` both ran for real on `ubuntu-24.04` GitHub-hosted runners and completed with `conclusion: success` — confirmed by reading the actual job logs (real `prospero-clang` invocations, real `readelf`/`sha256sum` output, real 115-check test pass, real artifact upload), not just the run's top-level status. See this milestone's session report for the run URL and IDs. |
+
+**Reproducibility caveat found this milestone**: two clean *local* builds
+produced byte-identical SHA-256 output, but the CI-built ELF's SHA-256
+differs from the local one. This is expected, not a bug: `-g` embeds the
+absolute build directory in DWARF debug info
+(`DW_AT_comp_dir`/`DW_AT_name`), and the local environment's checkout path
+(`/home/user/RomM-PS5`) differs from the runner's
+(`/home/runner/work/RomM-PS5/RomM-PS5`). The build is reproducible *given a
+fixed checkout path*, not yet reproducible byte-for-byte *across* arbitrary
+paths. A future improvement (not done this milestone) would be to add
+`-fdebug-prefix-map=$PWD=.` (or similar) to normalize this. Always quote
+the checksum of the specific artifact you actually have, not a
+different-environment build's — they are legitimately different files.
 
 ## What is mocked, not real
 
