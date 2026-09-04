@@ -34,6 +34,16 @@ Users are responsible for supplying their own legally obtained game backups and 
 
 Never commit RomM passwords or Client API Tokens to this repository. Credentials must be entered locally and excluded from logs, screenshots, examples, and test fixtures.
 
+## Development Deployment
+
+Once a build produces a compiled ELF payload, `tools/deploy_payload.py` sends it to a jailbroken PS5 running [etaHEN](https://github.com/etaHEN)'s `elfldr` listener (default port 9021) over a plain TCP connection, then prints any stdout/stderr the payload streams back:
+
+```
+python3 tools/deploy_payload.py --host <PS5_IP> path/to/payload.elf
+```
+
+This script assumes the console is already jailbroken by the user and `elfldr` is already running; it does not perform a jailbreak or exploit of any kind.
+
 ## Contributing
 
 The project is currently establishing its architecture and build system. Development contributions, hardware testing, documentation, and security review will be welcome once the initial foundation is available.
