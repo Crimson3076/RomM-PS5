@@ -6,9 +6,23 @@ The project aims to provide a controller-friendly library browser, authenticated
 
 ## Project Status
 
-RomM-PS5 is currently in early development and is not ready for general use. Features, installation procedures, storage layouts, and firmware compatibility may change.
+RomM-PS5 is currently in early development (Milestone 1: application
+foundation) and is not ready for general use. Features, installation
+procedures, storage layouts, and firmware compatibility may change.
+
+There is no RomM network integration, no download, and no extraction code
+yet — the current build renders a mock game list and proves the toolchain,
+UI, and module structure work end to end. See `docs/testing.md` for exactly
+what has and hasn't been verified, and `docs/architecture.md` for the
+research this is being built on.
 
 Do not install development builds unless you understand the risks involved. Interrupted or incorrect filesystem operations could result in incomplete files or data loss.
+
+## Building
+
+See [`docs/building.md`](docs/building.md) for host build instructions (the
+only target actually built and tested so far) and the current, unverified
+state of PS5 cross-compilation.
 
 ## Planned Features
 

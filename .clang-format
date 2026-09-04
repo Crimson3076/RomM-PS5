@@ -1,0 +1,11 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 80
+AlignAfterOpenBracket: Align
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: false
+BreakBeforeBraces: Attach
+PointerAlignment: Right
+SortIncludes: false

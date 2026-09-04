@@ -1,0 +1,42 @@
+name: Build and test (host)
+
+# Builds and tests only the "host" target (see CMakeLists.txt). The PS5
+# cross-compilation target requires the ps5-payload-dev/sdk toolchain,
+# which is not available in GitHub-hosted runners and has not yet been
+# verified anywhere in this project — see docs/architecture.md and
+# docs/building.md. This workflow exists to keep the host build and unit
+# tests from silently rotting, not to validate PS5 hardware compatibility.
+
+on:
+  push:
+    branches: [nightly, main]
+  pull_request:
+    branches: [nightly, main]
+  workflow_dispatch:
+
+jobs:
+  host-build-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libsdl2-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Headless smoke test (SDL dummy driver)
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+          ROMM_PS5_SMOKE_TEST_FRAMES: "30"
+        run: ./build/rommps5
