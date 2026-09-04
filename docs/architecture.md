@@ -98,120 +98,241 @@ an early spike rather than assuming the happy path.
 
 ## 3. RomM API
 
-RomM (target: 5.1+) exposes a REST API documented via OpenAPI:
+**Milestone 1 update:** the findings below replace the Milestone 0 table,
+which was based only on external docs/search results. `docs.romm.app` and
+`deepwiki.com` are still unreachable from this environment, so instead we
+cloned and read the actual backend source directly:
+`https://github.com/rommapp/romm`, commit `2c0fb087959e9a1cc3365e573b77b021490e292d`
+(`main` branch, 2026-09-04; `pyproject.toml` reports `version = "0.0.1"`,
+i.e. this is unreleased `main`, not a tagged 5.x version — re-check against
+whatever tag the user's actual RomM instance runs). This is ground truth for
+that commit, not a live-server test — behavior must still be confirmed
+against a real running instance before Milestone 2 is considered verified,
+but it is far stronger evidence than the external-docs pass.
 
+RomM exposes a REST API documented via OpenAPI, still expected at:
 - Swagger UI: `http(s)://<romm-host>/api/docs`
 - ReDoc: `http(s)://<romm-host>/api/redoc`
 - Raw spec: `http(s)://<romm-host>/openapi.json`
 
-Docs site (`docs.romm.app`) and `deepwiki.com` were **not reachable from this
-research environment** (blocked by network egress policy), so endpoint
-details below are drawn from GitHub search results (PR descriptions, wiki)
-rather than the full spec. **Action item for Milestone 2**: pull
-`openapi.json` directly from a real RomM instance and diff it against this
-document before writing the API client.
+### Authentication — CONFIRMED from source
 
-### Authentication
+`backend/handler/auth/hybrid_auth.py` and `backend/handler/auth/base_handler.py`:
+- Client API Tokens are generated server-side as `"rmm_" + secrets.token_hex(32)`
+  (a `rmm_` prefix followed by 64 hex characters).
+- Sent as `Authorization: Bearer rmm_<64-hex-chars>`. The auth middleware
+  detects the `rmm_` prefix on the bearer token specifically to route it to
+  Client-API-Token verification (as opposed to an OAuth2 JWT bearer token,
+  which is handled by a separate branch).
+- Confirms the task's requirement directly: we must never log the full
+  token value (redact to something like `rmm_ab12...ff90`).
 
-- RomM supports multiple auth modes: session cookies, HTTP Basic, OAuth2
-  Password Bearer, and **Client API Tokens**.
-- Client API Tokens are the correct mechanism for this app (matches the
-  task's stated requirement): format `rmm_<token>`, sent as
-  `Authorization: Bearer rmm_<token>`.
-- Tokens are scoped (a subset of the owning user's permissions, chosen at
-  creation) and hashed server-side; plaintext is never stored by RomM
-  itself. Up to 25 tokens per user.
-- Implication for us: we must never log the full `rmm_<token>` value
-  (matches the task's security requirements) — only a redacted form (e.g.
-  first/last 4 chars) in diagnostics.
+### Platform discovery — CONFIRMED from source
 
-### Core endpoints identified (UNVERIFIED against a live spec — confirm in Milestone 2)
+- `GET /api/platforms` (`backend/endpoints/platform.py`) → `list[PlatformSchema]`.
+  No platform-specific filter query param; the client fetches all platforms
+  and picks the one whose slug is `ps5`.
+- The PS5 platform's filesystem/IGDB slug is confirmed as the literal string
+  `"ps5"` (`backend/handler/metadata/base_handler.py: PS5 = "ps5"`, used
+  consistently across the metadata provider adapters). Use `PlatformSchema.id`
+  where `fs_slug == "ps5"` (or `slug == "ps5"`) as the `platform_ids` filter
+  value for `/api/roms`.
 
-| Purpose | Endpoint (best available evidence) | Notes |
-|---|---|---|
-| Platform discovery | `GET /api/platforms` (RomM convention) | Used to discover the PS5 platform ID before filtering ROMs |
-| List/search/sort ROMs | `GET /api/roms` | Supports pagination (`with_total` param confirmed via changelog PRs), filtering/search. Exact query-param names for search/sort need confirming against a live spec. |
-| ROM metadata detail | `GET /api/roms/{id}` (RomM convention) | Individual game metadata |
-| Cover artwork | Served as media asset URLs on the ROM object (`box2d`/cover fields) | Exact path pattern to confirm against live spec |
-| Single-file download | `GET /api/roms/{id}/content/{filename}` (RomM convention, "get a RomFile by ID and download that file by passing the ID and a filename") | Needs confirmation of exact path shape |
-| Bulk / multi-ROM / collection download (ZIP) | `GET /api/roms/download?rom_ids=...` (or `collection_id=`, `virtual_collection_id=`, `smart_collection_id=` — exactly one of these) | Confirmed via RomM PR history; streams a server-built ZIP |
-| Folder-based (multi-file) single game download | Same `mod_zip`-backed streaming path as bulk download | RomM's nginx frontend uses `mod_zip` (see §4) for any multi-file ZIP response, whether it's one folder-based game or a whole collection |
+### Listing / searching / sorting ROMs — CONFIRMED from source
 
-Since exact param/path names could not be independently verified against a
-live OpenAPI spec in this pass, **the API client module must be built
-against a real `openapi.json` pull in Milestone 2**, not against this table
-alone.
+`GET /api/roms` (`backend/endpoints/roms/__init__.py`, `get_roms`), scope
+`Scope.ROMS_READ`. Confirmed query parameters relevant to us:
+- `platform_ids` (repeatable) — filter to PS5 by platform id from above.
+- `search_term` — free-text search.
+- `order_by` (string field name, empty = relevance-on-search / name
+  otherwise) and `order_dir` (`asc`/`desc`).
+- `limit` (1–10000, default 50) and `offset` — real offset pagination
+  (`CustomLimitOffsetParams`), matches the task's pagination requirement.
+- `with_total`, `with_char_index`, `with_filter_values`, `with_rom_id_index`
+  — all `bool`, default `true`; **we should pass all of these as `false`**
+  for a PS5-only browser, since we don't need the alphabet-jump index, the
+  full filter-value lists (genres/companies/etc — not relevant to a
+  single-platform PS5 library), or the full ordered id index that backs
+  virtual scroll on RomM's own web UI. This avoids RomM computing
+  library-wide sidecar data on every page request.
+- `with_files` (bool, default `false`) — set `true` when we need each ROM's
+  file list (needed to know file/folder format up front); otherwise the
+  response only carries per-ROM aggregate stats.
+- Response type `CustomLimitOffsetPage[SimpleRomSchema]`: `items`, `total`,
+  `limit`, `offset`, plus the sidecar fields above.
+- `SimpleRomSchema`/`RomSchema` (`backend/endpoints/responses/rom.py`)
+  fields relevant to the library browser: `fs_name`, `fs_name_no_tags`,
+  `fs_extension`, `fs_path`, **`fs_size_bytes`** (see below),
+  `platform_display_name`, plus IGDB/Moby/etc metadata ids used for cover
+  art lookups.
+- `GET /api/roms/{id}` → `DetailedRomSchema` (full metadata detail screen).
+  `GET /api/roms/{id}/simple` → lighter `SimpleRomSchema` (no eager user
+  saves/states/notes/collections — prefer this for our detail screen unless
+  we specifically need those fields).
+
+### `fs_size_bytes` — CONFIRMED, corrects an implicit Milestone 0 assumption
+
+`fs_size_bytes` is a plain `BigInteger` column on the `Rom` model
+(`backend/models/rom.py`), populated from the sum of the underlying files'
+real on-disk sizes as scanned from the filesystem. **It is the extracted /
+uncompressed content size, not the size of any generated ZIP archive.**
+- For a single-file ROM (or a single downloadable image format like
+  `.ffpkg`), this is expected to equal the download's `Content-Length`
+  exactly.
+- For a folder-based, multi-file ROM (our PS5 case), the actual ZIP transfer
+  will be `fs_size_bytes` plus small ZIP framing overhead (local file header
+  + central directory entry per file, roughly 30–90 bytes each) — never
+  less than `fs_size_bytes`. Use `fs_size_bytes` for space-check estimates
+  and progress-bar totals, but **do not** treat it as a byte-exact expected
+  transfer size for validation; use the response's real `Content-Length`
+  (see below) for that instead.
+
+### Cover artwork
+
+Not yet independently re-verified against source in this pass (still an
+open item); external-docs findings (box2d cover fields on the ROM object)
+stand from Milestone 0. Confirm exact media URL fields against a live
+`DetailedRomSchema`/`SimpleRomSchema` response in Milestone 2.
+
+### Single-file and folder-based download — CONFIRMED from source, and this materially changes the Milestone 0 picture
+
+Endpoint: `GET /api/roms/{id}/content/{file_name}` (also a `HEAD` variant at
+the same path), scope `Scope.ROMS_READ` (`backend/endpoints/roms/__init__.py:
+get_rom_content` / `head_rom_content`). `file_name` is only the desired
+download/zip display name; RomM selects the actual file(s) to serve from the
+ROM's own file list server-side (optionally narrowed with a `file_ids=`
+comma-separated query param for multi-part ROMs).
+
+Behavior branches on how many files the ROM has on disk, **and (for the
+multi-file case) whether the request carries a `Range` header**:
+
+1. **Single file** (`len(files) == 1`, e.g. a `.ffpkg`/`.exfat` image or a
+   ROM that happens to be one file): RomM returns a `FileRedirectResponse`,
+   which sets `X-Accel-Redirect` and lets nginx serve the real file directly
+   from `/library/<full_path>`. This is **plain nginx static file serving**:
+   real `Content-Length`, `Accept-Ranges: bytes`, and full, reliable HTTP
+   Range/resume support — no RomM-specific caveats. This is our
+   highest-confidence, lowest-risk download path.
+
+2. **Multi-file / folder-based ROM, no `Range` header on the request**
+   (the default first request in most clients): RomM returns a custom
+   `ZipResponse` (`backend/utils/nginx.py`) with header `X-Archive-Files: zip`
+   and a body listing each file as `<crc32> <size_bytes> <encoded_location>
+   <filename>` (the `mod_zip` protocol,
+   https://github.com/evanmiller/mod_zip). **RomM always sets `crc32` to
+   `None` (`-`) here** — the code comment explicitly says the CRC stored in
+   the DB is "for the uncompressed content" and is not reused here. Per
+   `mod_zip`'s own contract, **omitting the CRC disables Range-header
+   support entirely** for this response — this is not a maybe, RomM's code
+   guarantees a fresh streamed folder-download can never be resumed.
+   `Content-Length` **is** still provided correctly (nginx/mod_zip computes
+   it from the given sizes, independent of the CRC), so progress-by-total is
+   fine — resume is what's unavailable.
+   - Entries are STORED-equivalent (sizes known upfront, no data-descriptor
+     dependency), so our incremental-extraction-while-streaming plan from
+     Milestone 0 still holds for this path specifically.
+
+3. **Multi-file / folder-based ROM, request carries a `Range` header**:
+   RomM does **not** use the live streaming path at all. It calls
+   `resolve_cached_zip()` (`backend/utils/zip_cache.py`), which:
+   - Computes a deterministic cache key from the file list + mtimes.
+   - If a cached ZIP already exists on the server for that key, redirects to
+     it immediately.
+   - Otherwise **synchronously builds a complete, standard ZIP_STORED
+     archive on the RomM server's own disk** (via Python's `zipfile`,
+     locked per-namespace against concurrent builds, written to a temp file
+     and atomically renamed), under `ZIP_CACHE_PATH`, with a TTL of 48h
+     (12h if the resulting zip is over 8 GB).
+   - Serves the finished cache file the same way as case 1 — real
+     `Content-Length`, `Accept-Ranges: bytes`, full Range/206 support.
+   - If the build fails for any reason (e.g. the RomM server's own disk is
+     full), `resolve_cached_zip()` returns `None` and RomM **silently falls
+     back to case 2** (the non-resumable live stream) even though the
+     client asked for a Range — so a 200 with no `Accept-Ranges`/
+     `Content-Range` can come back even when we requested a range, and we
+     must detect and treat that as "not resumable," not error.
+   - A cheap way to check current resumability without paying the build
+     cost: the `HEAD` variant, when the ROM is multi-file, returns
+     `Content-Length` + `Accept-Ranges: bytes` **only if a cache entry
+     already exists**; otherwise it returns bare headers with neither. Our
+     download manager can use `HEAD` to decide whether to request a Range
+     immediately or expect a first-attempt build delay.
+
+### This corrects the Milestone 0 claim that folder ZIPs are "never materialized on disk"
+
+That is only true for the no-Range/default path (case 2 above). **Folder
+downloads are resumable in RomM only by paying a real cost: the RomM
+*server* must build and temporarily store a full, second copy of the game
+folder as a real ZIP file on its own disk** before any resumable bytes are
+sent — the "avoid a second full-size copy" problem isn't eliminated for
+folder games, it's moved from the PS5 client's storage to the RomM server's
+storage, and only for downloads that request a Range.
+
+**New, higher-priority risk for this project**: for a very large PS5 game
+folder (the task's own >100 GB case), forcing the Range/cache-build path to
+get resume support means the RomM server must synchronously zip 100+ GB
+before responding — this could take minutes, is a real risk of client/proxy
+timeouts on the *first* byte, and requires 100+ GB of *free space on the
+RomM server itself*, which we have no visibility into or control over from
+the PS5 client. Practical policy for our download manager, pending real
+testing in Milestone 4:
+- Prefer the plain, non-Range streamed download (case 2) for the initial
+  attempt of a folder-based game, and accept that **a folder-game download
+  interrupted mid-transfer must restart from zero** unless we have separate
+  evidence (a `HEAD` check showing an existing cache entry) that a resumable
+  cached copy is already sitting on the server.
+- Never claim or imply to the user that a folder-game transfer can resume
+  by default. This matches the task's explicit requirement.
+- Treat "request a Range and hope the server already cached it" as an
+  optional, clearly-labeled best-effort path, not the default behavior.
+
+### Bulk / collection download (not used by the MVP, documented for completeness)
+
+`GET /api/roms/download?rom_ids=1,2,3` (or `platform_id=` / `collection_id=`
+/ `virtual_collection_id=` / `smart_collection_id=`, exactly one selector) —
+same two-path logic as above, capped at `BULK_CACHE_MAX_ROMS = 100` ROMs for
+the cache-build path. Not needed for single-game downloads; documented in
+case a future "download whole library" feature is considered — which is out
+of scope for the MVP.
 
 ---
 
-## 4. Folder-download / ZIP streaming behavior
+## 4. Folder-download / ZIP streaming behavior — summary
 
-This is the most consequential finding of Milestone 0.
+This is the most consequential set of findings from Milestone 0/1 research,
+now backed by source rather than external docs. See §3 above for the full,
+source-cited detail; this section is the short version for quick reference.
 
-- RomM's backend does **not** pre-build ZIP files on disk. The bundled
-  **nginx** front end is compiled with **`mod_zip`**
-  (https://github.com/evanmiller/mod_zip), which streams a ZIP archive to
-  the client by having the RomM backend return a small internal response
-  listing the files to include (path/size/CRC32/name), and nginx assembles
-  the ZIP framing on the fly, streaming file bytes directly from disk.
-  RomM's own docs describe this as: "streams a zip archive over HTTP without
-  ever materialising it on disk," so "the browser sees a zip download start
-  immediately... regardless of folder size."
-- Implication: entries are served as **stored (uncompressed)** ZIP members
-  with **known sizes and CRC32 up front**, not deflate-compressed and not
-  using a trailing data descriptor. This is favorable for our use case:
-    - A ZIP central directory is not required before extraction can begin —
-      each local file header carries the entry's real size and CRC because
-      mod_zip knows them in advance. This means **sequential, incremental
-      extraction while streaming is architecturally plausible**: we can
-      parse each local file header as it arrives and stream its bytes
-      straight to the destination file without buffering the whole
-      response or waiting for the central directory at the end.
-    - This lets us avoid needing ~2x the game's size on disk (one copy for
-      the downloaded ZIP, one for the extracted folder) — a stated MVP goal.
-  - **UNVERIFIED**: this must be confirmed against real HTTP responses from
-    a live RomM server (byte-level inspection of local file header flags,
-    specifically confirming the "general purpose bit flag 3" data-descriptor
-    bit is NOT set, and that sizes in local headers are non-zero/accurate)
-    before we build extraction logic around this assumption. If any RomM
-    deployment falls back to a non-`mod_zip` code path (e.g. `mod_zip`
-    unavailable in some Docker builds), the safe assumption above may not
-    hold, and we must detect this and fall back to buffering.
-
-### HTTP Range / resume
-
-- `mod_zip` explicitly supports `Range`/`If-Range` for **resuming** a
-  download, **but only when the CRC32 of every included file is already
-  known to nginx** at request time — RomM's own module description says:
-  "If you don't know the CRC-32, mod_zip will disable support for the Range
-  header." Since RomM computes checksums when scanning the library and
-  stores them, this is expected to be available in most cases, but:
-  - **UNVERIFIED**: whether RomM always supplies CRC32 to `mod_zip` for
-    every scanned file (e.g. freshly added files pending a rescan, or files
-    added via unusual import paths might lack a computed checksum).
-  - Practical rule for our download manager: **attempt Range-resume, but
-    detect and gracefully handle a server that refuses/ignores the Range
-    header** (falls back to restart) rather than assuming resume always
-    works for folder-based downloads. This satisfies the task requirement:
-    "Never pretend a folder transfer can resume when it must restart."
-- For **single-file downloads** (the `.ffpkg`/`.exfat`/`.ffpfs`/`.ffpfsc`
-  case, or a single ROM file), standard HTTP Range resume against a static
-  file response is the normal case and considered reliable, standard
-  behavior — no RomM-specific caveat found.
+- **Live stream (no Range)**: `mod_zip`, STORED-equivalent entries, sizes
+  known upfront (safe for incremental extraction), `Content-Length` present,
+  **CRC32 deliberately omitted by RomM → Range/resume never works on this
+  path**, confirmed from source (`ZipContentLine(crc32=None, ...)` in
+  `backend/endpoints/roms/__init__.py`).
+- **Range-requested path**: RomM builds a complete, real ZIP_STORED archive
+  **on its own server disk** (not the PS5 client's) via Python's `zipfile`,
+  then serves it as a normal static file with full Range support. This is
+  the only resumable folder-download path, and it shifts the "double
+  storage" cost to the RomM server rather than eliminating it, with a real
+  risk of first-byte timeouts on very large folders.
+- **Single-file downloads** (including `.ffpkg`/`.exfat`/`.ffpfs`/`.ffpfsc`
+  images and any ROM that happens to be one file) always go through plain
+  nginx static file serving — reliable `Content-Length` and Range/resume,
+  no caveats.
 
 ### Safe incremental extraction — summary risk statement
 
-Streaming incremental extraction of RomM's folder-ZIP without a second full
-copy on disk is **architecturally plausible and worth building toward**, but
-is **not yet proven**. It depends on: (a) `mod_zip` always emitting
-non-deflated, size-known-up-front entries (strong evidence, not yet
-byte-verified), and (b) our extractor being strict about validating each
-entry (size, path safety) before trusting it, per the filesystem-safety
-requirements. If real-world testing (Milestone 4) finds cases that break
-this assumption, the documented fallback is: buffer the ZIP to a temporary
-file first, extract from that, and accept the 2x-space requirement with a
-clear warning to the user before starting — never silently corrupt a
-partial extraction.
+Streaming incremental extraction of a live-streamed folder ZIP (case 2)
+without a second full copy on disk remains **architecturally sound and
+worth building toward** — entry sizes are always known upfront in both the
+live-stream and server-cached-zip cases, so a strict, validating streaming
+extractor (checking size, path safety, and rejecting anything unexpected
+before trusting an entry) should work for either. This is still **not
+byte-verified against a real server response** in this research pass — that
+remains a Milestone 2 hardware/integration-test action item. If real-world
+testing finds cases that break this assumption, the documented fallback is:
+buffer the ZIP to a temporary file first, extract from that, and accept the
+2x-space requirement with a clear warning to the user before starting —
+never silently corrupt a partial extraction.
 
 ---
 
@@ -236,19 +357,35 @@ partial extraction.
    research pass. This is the top risk for the whole project and should be
    the first hardware spike: get a single authenticated HTTPS GET working
    on real hardware before investing in the full download manager.
-2. **RomM API endpoint shapes are best-effort, not verified against a live
-   spec.** Must pull real `openapi.json` from a running RomM 5.1+ instance
-   before writing the API client (Milestone 2).
-3. **`mod_zip` stream structure (no compression, sizes known up front) is
-   inferred from documentation, not byte-verified.** Must confirm with a
-   real folder-game download before committing to zero-buffer incremental
-   extraction.
-4. **Range/resume support for folder downloads is conditional** on RomM
-   having CRC32 available for every file; must be treated as "try, verify,
-   fall back to restart" rather than guaranteed.
+2. **RomM API endpoint shapes are now source-verified (§3) against
+   `rommapp/romm` @ `2c0fb08` (main, 2026-09-04), not just external docs —
+   a significant confidence upgrade from Milestone 0.** Still not verified
+   against a live running instance or a tagged 5.x release; re-confirm
+   `platform`/`roms` query-param names and response shapes against the
+   user's actual RomM version's `/openapi.json` before finalizing the API
+   client in Milestone 2, since `main` can drift from any given release tag.
+3. **`mod_zip` stream structure is now source-confirmed** (§3/§4): STORED,
+   sizes known upfront, `Content-Length` present, CRC32 deliberately
+   omitted by RomM on the live-stream path. Still not byte-verified against
+   a real HTTP response in this pass (no live server available) — do that
+   in Milestone 2/4 before finalizing the streaming extractor.
+4. **Range/resume support for folder downloads is now precisely
+   characterized, and the picture is worse than Milestone 0 assumed**:
+   a fresh live-streamed folder download can *never* resume (RomM always
+   omits CRC32 on that path), and resume is only possible by triggering
+   RomM's server-side cache-build (§3), which materializes a full second
+   copy of the game on the *RomM server's* disk and risks first-byte
+   timeouts for very large (>100 GB) folders. Our download manager must
+   default to "folder downloads restart from zero on interruption" and
+   treat Range-triggered resume as an optional, best-effort path — never
+   promise resume by default for folder-based games.
 5. **Large-file (>100 GB) behavior is unverified** — both PS5 syscall/libc
    large-file support and target filesystem (exFAT USB vs internal) limits
-   need real-hardware testing.
+   need real-hardware testing. Now compounded by risk #4: a >100 GB folder
+   game requesting Range-resume could force the RomM server to spend
+   minutes synchronously building a 100+ GB zip before the first byte
+   arrives, which may exceed client/proxy timeouts independent of anything
+   on the PS5 side.
 6. **Free-space reporting API on PS5 is unverified.**
 7. **Image decoding (PNG/JPEG) path is unverified** — SDL_image or an
    equivalent has not been confirmed to build against the PS5 sysroot.
