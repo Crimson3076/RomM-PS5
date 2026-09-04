@@ -61,6 +61,16 @@ static bool probe_one(const char *full_path, StorageDestination *dest) {
     return true;
 }
 
+bool storage_get_free_bytes(const char *path, uint64_t *free_bytes_out) {
+    struct statvfs vfs;
+    if (statvfs(path, &vfs) != 0) {
+        return false;
+    }
+    uint64_t frag_size = (uint64_t)(vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize);
+    *free_bytes_out = frag_size * (uint64_t)vfs.f_bavail;
+    return true;
+}
+
 size_t storage_discover(const char *const *candidates, size_t candidate_count,
                          const char *prefix, StorageDestination *out,
                          size_t out_capacity) {

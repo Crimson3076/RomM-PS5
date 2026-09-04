@@ -49,6 +49,13 @@ size_t storage_discover(const char *const *candidates, size_t candidate_count,
                          const char *prefix, StorageDestination *out,
                          size_t out_capacity);
 
+/* Single-path free-space query, for a caller (src/download/downloader.c)
+ * that already knows its destination directory and just needs a fresh
+ * space check before starting a transfer, rather than the fixed candidate
+ * list storage_discover() enumerates. Returns false (leaving
+ * *free_bytes_out unchanged) if `path` doesn't exist or statvfs() fails. */
+bool storage_get_free_bytes(const char *path, uint64_t *free_bytes_out);
+
 #ifdef __cplusplus
 }
 #endif

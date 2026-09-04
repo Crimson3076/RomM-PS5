@@ -30,6 +30,9 @@ typedef enum {
 typedef struct {
     int32_t id;
     char title[ROMM_TITLE_MAX];
+    char fs_name[ROMM_TITLE_MAX]; /* RomM's on-disk name for this ROM — used
+                                    * to build the /content/{file_name}
+                                    * download URL; may differ from title */
     char title_id[ROMM_TITLE_ID_MAX]; /* empty string if unknown */
     char version[ROMM_VERSION_MAX];   /* empty string if unknown */
     RommGameFormat format;

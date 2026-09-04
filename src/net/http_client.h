@@ -1,15 +1,17 @@
-/* HTTP transport interface. This is a placeholder for Milestone 1: the
- * shape of the abstraction the download manager and RomM API client will
- * eventually use, so UI/API/download code can be written and tested
- * against it now without depending on a concrete network stack.
+/* HTTP transport interface. UI/API/download code is written against this
+ * abstraction, never against a concrete network stack directly.
  *
- * No implementation in this milestone performs a real network request —
- * per docs/architecture.md, whether libcurl (or any HTTP+TLS stack) even
- * builds against the ps5-payload-dev/sdk sysroot is UNVERIFIED and is the
- * top risk for the whole project. That must be resolved with a real
- * on-device spike before this interface gets a real backend. Only
- * `http_client_null_init()` (always returns HTTP_ERR_UNIMPLEMENTED) exists
- * today.
+ * Two real implementations exist:
+ *   - http_client_ps5_init() (src/net/http_client_ps5.c): uses the PS5's
+ *     own SceNet/SceSsl/SceHttp2 system libraries. COMPILED for PS5, NOT
+ *     yet run on hardware — see docs/testing.md.
+ *   - http_client_null_init(): every call returns HTTP_ERR_UNIMPLEMENTED.
+ *     Used where a client is needed structurally but no request should
+ *     ever actually happen (e.g. as a safe default before configuration
+ *     is loaded).
+ * Host-side tests use a test-only in-process mock (tests/mock_http_client.c)
+ * instead of a real network stack, so RomM API client logic is verified
+ * without needing real sockets.
  */
 #ifndef ROMM_PS5_HTTP_CLIENT_H
 #define ROMM_PS5_HTTP_CLIENT_H
@@ -29,6 +31,7 @@ typedef enum {
     HTTP_ERR_TLS,
     HTTP_ERR_TIMEOUT,
     HTTP_ERR_HTTP_STATUS, /* request completed, but status was an error */
+    HTTP_ERR_CANCELLED,   /* the body sink returned false */
 } HttpResult;
 
 typedef struct {
@@ -54,6 +57,14 @@ typedef struct {
 typedef struct HttpClient {
     void *ctx;
 
+    /* Contract every implementation must follow: `*response_out` is
+     * populated (status_code, content_length, is_partial_content,
+     * accept_ranges) BEFORE the first `sink` call, not just before `get`
+     * returns. This lets a caller's sink inspect e.g. whether a Range
+     * request actually got a 206 (see src/download/downloader.c, which
+     * needs to know that before deciding whether to append to or
+     * truncate its output file) without having to buffer anything or
+     * wait for the whole transfer to finish. */
     HttpResult (*get)(void *ctx, const HttpRequest *request,
                        HttpResponseInfo *response_out, HttpBodySink sink,
                        void *sink_user_data);

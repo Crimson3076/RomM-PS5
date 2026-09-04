@@ -1,7 +1,8 @@
-/* Download-manager state machine. Milestone 1 implements only the state
- * transitions and progress bookkeeping — no real network or filesystem I/O.
- * Wiring this to the real HTTP client and archive extractor is Milestone
- * 2/4 work, once the network/TLS spike in docs/architecture.md is resolved.
+/* Download-manager state machine: legal transitions and progress
+ * bookkeeping, deliberately kept free of any real network/filesystem I/O
+ * so it stays trivially host-testable. src/download/downloader.c is the
+ * module that actually performs a download and drives this state machine;
+ * it owns the HttpClient, file I/O, and extraction calls.
  */
 #ifndef ROMM_PS5_DOWNLOAD_MANAGER_H
 #define ROMM_PS5_DOWNLOAD_MANAGER_H
@@ -27,6 +28,12 @@ typedef struct {
     DownloadState state;
     uint64_t bytes_transferred;
     uint64_t bytes_total; /* 0 = unknown */
+    uint64_t speed_bytes_per_sec; /* 0 = not yet measured; set directly by
+                                    * the caller (src/download/downloader.c),
+                                    * not by this module's own functions —
+                                    * computing a rate needs wall-clock time,
+                                    * which is outside this module's job of
+                                    * "is this transition/update legal". */
     char failure_reason[128];
 } DownloadProgress;
 

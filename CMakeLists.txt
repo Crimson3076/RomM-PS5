@@ -41,12 +41,15 @@ endif()
 #          docs/testing.md for exactly what that means.
 #
 # SDL is intentionally host-only: the ps5-payload-dev/sdk's own sample set
-# (samples/) has no SDL example and does not bundle SDL, and no other
-# maintained homebrew project consumed during this project's research was
-# confirmed to build SDL against this exact SDK. The PS5 target instead uses
-# the same on-screen/notification/input approach the SDK's own maintained
-# samples use (ScePad, SceNotification, SceUserService) — see
-# src/ps5/main_ps5.c and docs/architecture.md for the reasoning.
+# (samples/) has no SDL example and does not bundle SDL, and building the
+# full ps5-payload-dev/SDL port was investigated and rejected — its PS5
+# video backend depends on libOSMesa.so.8 at runtime, a third-party library
+# with no evidence of being present on a bare jailbroken PS5 (see
+# docs/architecture.md). The PS5 target instead talks to the console
+# directly: sceVideoOut for graphics (src/ps5/video.c, with the GPU tiling
+# math adapted from that same SDL port's source — see src/ps5/tilemap.h),
+# ScePad + SceUserService for DualSense input (src/ps5/pad.c), and
+# SceNet/SceSsl/SceHttp2 for networking (src/net/http_client_ps5.c).
 if(PROSPERO)
   set(ROMM_PS5_IS_PS5_TARGET ON)
 else()
@@ -57,34 +60,87 @@ option(ROMM_PS5_BUILD_TESTS "Build the unit test suite (host target only)" ON)
 
 # Modules confirmed to compile unchanged for both host and ps5 targets (see
 # docs/testing.md "PS5 cross-compilation" for the module-by-module result).
-# None of these use SDL or any host-only API.
+# None of these use SDL or any PS5-native SCE syscall — that includes
+# src/ps5/tilemap.c and src/ps5/font_render.c, which despite living under
+# src/ps5/ (otherwise the ps5-only-syscalls directory) are pure address/
+# pixel math with no SCE calls, so they're built here to stay host-testable
+# rather than only ever compiled for a target this project can't run tests
+# on directly.
 add_library(rommps5_core STATIC
   src/pathval/path_validate.c
   src/download/download_manager.c
+  src/download/downloader.c
+  src/download/zip_extract.c
   src/log/log.c
   src/config/config.c
+  src/config/credentials.c
   src/storage/storage.c
   src/net/http_client_null.c
+  src/net/url_encode.c
   src/romm_api/romm_api_mock.c
+  src/romm_api/romm_api_http.c
   src/mockdata/mock_library.c
+  src/ps5/tilemap.c
+  src/ps5/font_render.c
+  third_party/cjson/cJSON.c
+  third_party/font8x8/font8x8_data.c
 )
 target_include_directories(rommps5_core PUBLIC src)
+target_include_directories(rommps5_core PUBLIC third_party/cjson third_party/font8x8)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  # cJSON and font8x8's data file are vendored third-party code
+  # (third_party/THIRD_PARTY_LICENSES.md) built with this project's own
+  # -Wall -Wextra -Wconversion etc — neither promises to be warning-clean
+  # under those, so they get their own relaxed flags rather than polluting
+  # this project's warning-clean build with upstream code it doesn't
+  # control. src/ps5/font_render.c, which is this project's own code, is
+  # deliberately NOT included here — see its extern declaration of
+  # font8x8_basic instead of including font8x8_basic.h directly.
+  set(ROMM_PS5_CJSON_EXTRA_FLAGS "-Wno-conversion;-Wno-sign-conversion")
+  if(ROMM_PS5_IS_PS5_TARGET)
+    # The pinned SDK's own target/include/math.h defines isnan()/isinf()
+    # as _Generic-style macros over qualified (volatile/const) type
+    # associations, which clang always warns are unreachable — a property
+    # of that system header, unrelated to anything cJSON.c (which just
+    # calls isnan()/isinf() normally) does. Host builds don't hit this,
+    # since the host libc's math.h doesn't use this pattern.
+    list(APPEND ROMM_PS5_CJSON_EXTRA_FLAGS "-Wno-unreachable-code-generic-assoc")
+  endif()
+  set_source_files_properties(third_party/cjson/cJSON.c PROPERTIES
+    COMPILE_OPTIONS "${ROMM_PS5_CJSON_EXTRA_FLAGS}")
+  set_source_files_properties(third_party/font8x8/font8x8_data.c PROPERTIES
+    COMPILE_OPTIONS "-Wno-conversion;-Wno-sign-conversion")
+endif()
 
 if(ROMM_PS5_IS_PS5_TARGET)
   # PS5-native executable: no SDL, no host UI. Talks to the console via SCE
   # system libraries directly — see src/ps5/main_ps5.c.
-  add_executable(rommps5-ps5 src/ps5/main_ps5.c)
-  # SCE system libraries this minimal ELF calls into directly (see
-  # src/ps5/main_ps5.c) — link flags copied from the ps5-payload-dev/sdk
-  # v0.43 samples that use each one (browser, notify, hwinfo); ScePad's
-  # flag name follows the same lib<Name>.so -> -l<Name> convention as the
-  # others, confirmed against sce_stubs/libScePad.so in that same SDK.
+  add_executable(rommps5-ps5
+    src/ps5/main_ps5.c
+    src/ps5/pad.c
+    src/ps5/video.c
+    src/ps5/screens.c
+    src/net/http_client_ps5.c
+  )
+  # SCE system libraries this ELF calls into directly — link flags copied
+  # from the ps5-payload-dev/sdk v0.43 samples that use each one (browser,
+  # hwinfo, http2_get: confirmed via that sample's own Makefile, which
+  # links "-lSceNet -lSceSsl -lSceHttp2"). ScePad/SceVideoOut/
+  # SceSystemService follow the same lib<Name>.so -> -l<Name> convention as
+  # the others, confirmed against the matching sce_stubs/lib<Name>.so files
+  # in that same SDK (no sample links them, since no sample uses ScePad,
+  # video output, or SystemService — see src/ps5/pad.c and src/ps5/video.c
+  # for what within each is sample-verified vs convention-inferred).
   target_link_libraries(rommps5-ps5 PRIVATE
     rommps5_core
     SceUserService
-    SceNotification
     kernel_sys
     ScePad
+    SceNet
+    SceSsl
+    SceHttp2
+    SceVideoOut
+    SceSystemService
   )
 
 else()

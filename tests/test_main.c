@@ -9,6 +9,11 @@ void test_romm_api_mock(TestCounters *tc);
 void test_storage(TestCounters *tc);
 void test_config(TestCounters *tc);
 void test_log_file_sink(TestCounters *tc);
+void test_url_encode(TestCounters *tc);
+void test_config_credentials(TestCounters *tc);
+void test_zip_extract(TestCounters *tc);
+void test_romm_api_http(TestCounters *tc);
+void test_downloader(TestCounters *tc);
 
 typedef struct {
     const char *name;
@@ -24,6 +29,11 @@ int main(void) {
         {"storage", test_storage},
         {"config", test_config},
         {"log_file_sink", test_log_file_sink},
+        {"url_encode", test_url_encode},
+        {"config_credentials", test_config_credentials},
+        {"zip_extract", test_zip_extract},
+        {"romm_api_http", test_romm_api_http},
+        {"downloader", test_downloader},
     };
     size_t test_count = sizeof(tests) / sizeof(tests[0]);
 

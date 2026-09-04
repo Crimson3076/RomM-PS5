@@ -38,9 +38,15 @@ bool download_progress_transition(DownloadProgress *p, DownloadState next) {
     p->state = next;
     if (next == DL_STATE_IDLE || next == DL_STATE_DOWNLOADING) {
         /* Fresh attempt (first start or retry): counters and any stale
-         * failure reason from a previous attempt must not leak forward. */
+         * failure reason from a previous attempt must not leak forward.
+         * A caller resuming a partial download corrects bytes_transferred
+         * right back to the on-disk partial size immediately after this
+         * call, via download_progress_update_bytes() — legal because
+         * that function only requires DL_STATE_DOWNLOADING, which is
+         * already true by the time this line runs. */
         p->bytes_transferred = 0;
         p->bytes_total = 0;
+        p->speed_bytes_per_sec = 0;
         p->failure_reason[0] = '\0';
     }
     return true;

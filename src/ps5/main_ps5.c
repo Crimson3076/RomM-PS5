@@ -1,231 +1,325 @@
-/* RomM-PS5 — minimal PS5-native entry point (PS5 cross-compilation
- * milestone). Not the SDL UI (src/main.c) — that's host-only, see
- * docs/building.md "Keep host-only SDL ... separated from PS5-specific
- * code". This file exists to prove the pinned ps5-payload-dev/sdk
- * toolchain can actually build and run something meaningful on real
- * hardware, not to implement the real application UI.
+/* RomM-PS5 — real PS5-native application entry point.
  *
- * What this does, and why each call was chosen:
- *   1. Initializes UserService (required before most other SCE calls that
- *      touch a logged-in user — pattern copied from
- *      ps5-payload-dev/sdk samples/browser/main.c). CONFIRMED on real
- *      hardware (see docs/testing.md "First hardware test").
- *   2. Opens the persistent log file and logs via this project's own log
- *      module (src/log/log.c), which now fans every log_message() call
- *      out to both stderr (the elfldr TCP connection) and the file — see
- *      log.h. This replaced a hand-rolled, module-specific
- *      duplicate-logging pattern that silently dropped several lines from
- *      the file on the first hardware test; see docs/testing.md.
- *   3. Logs the console's hardware model name via sceKernelGetHwModelName
- *      (prototype copied from samples/hwinfo/main.c). CONFIRMED on real
- *      hardware.
- *   4. Runs this project's real storage_discover() against the actual
- *      fixed candidate destination list (src/storage/storage.c).
- *      CONFIRMED on real hardware.
- *   5. Sends an on-screen toast notification via sceNotificationSend
- *      (prototype + JSON payload shape copied from
- *      samples/notify/main.c). CONFIRMED on real hardware.
- *   6. Attempts to obtain a real user id, then open (but not read from) a
- *      ScePad controller handle. See the SceUserService/ScePad section
- *      below — this is a documented blocker, not a working feature yet.
- *   7. Terminates UserService (only if it was actually initialized) and
- *      exits cleanly, flushing and closing the persistent log.
+ * This is the first end-to-end vertical slice: load credentials, connect
+ * to a real RomM server, list the PS5 library, let the user pick a game
+ * with a DualSense, download it with live progress, and extract it — all
+ * on-console, no mock data. It supersedes the earlier cross-compilation
+ * milestone's minimal hello-world ELF (see git history for that file's
+ * prior content); this file now owns the real application loop instead
+ * of just proving the toolchain works.
  *
- * --- SceUserService / ScePad: investigation result and blocker ---
+ * Every PS5-native building block this wires together documents its own
+ * verified-vs-inferred status where it's implemented, not here:
+ *   - src/net/http_client_ps5.c   (SceNet/SceSsl/SceHttp2)
+ *   - src/ps5/pad.c                (ScePad + SceUserService)
+ *   - src/ps5/video.c              (sceVideoOut direct framebuffer scanout)
+ * This file's own job is orchestration and UI flow, not SCE ABI calls
+ * directly (besides the small, already-verified SceUserService lifecycle
+ * pair and sceKernelGetHwModelName kept from the earlier milestone).
  *
- * The first hardware test (see docs/testing.md) showed
- * `sceUserServiceGetInitialUser` failing. Investigating the pinned SDK
- * (ps5-payload-dev/sdk v0.43) directly — every sample's source, every
- * stub file under sce_stubs, and the full include/ tree — found:
- *   - `sceUserServiceInitialize(0)` / `sceUserServiceTerminate()` are the
- *     ONLY UserService calls demonstrated anywhere in this SDK
- *     (samples/browser/main.c), and this pair is confirmed working on
- *     real hardware.
- *   - `sceUserServiceGetInitialUser` is a real, exported symbol in
- *     sce_stubs/libSceUserService.so (confirmed by inspecting the stub
- *     library directly — one of ~300 exported SceUserService symbols),
- *     but its signature, its argument meaning, and what its return value
- *     means are NOT documented anywhere in this SDK: no sample calls it,
- *     no header declares it, no comment describes it. The
- *     `int32_t *userId` out-param signature used in the previous version
- *     of this file was sourced from general PS4/PS5 homebrew convention,
- *     not from this SDK — i.e. it was a guess, and the hardware test's
- *     failure is real evidence that guess should not be trusted further.
- *   - No SCE_USER_SERVICE_ERROR_* (or similar) constants exist anywhere
- *     in this SDK, so even the numeric failure code from that call cannot
- *     be authoritatively interpreted (e.g. distinguished from a
- *     documented "already initialized"-style condition) — there is
- *     nothing documented to compare it against.
- *   - No sample in this SDK obtains a real user id at all, by any
- *     function — install_app and browser (the other two samples linking
- *     -lSceUserService) don't either.
- *
- * Per this project's policy against guessing undocumented ABI: this file
- * no longer calls `sceUserServiceGetInitialUser`. There is currently no
- * SDK-verified way, anywhere in the pinned SDK, to obtain a real user id
- * from a raw elfldr-launched payload. That blocks `scePadOpen` (which
- * needs one), so ScePad open is skipped and logged as a documented
- * blocker rather than an attempted-and-failed call. `scePadInit()` is
- * still called — it takes no arguments, so there is no struct/constant
- * layout to guess, unlike scePadOpen/scePadReadState.
- *
- * Resolving this blocker for real needs one of: an authoritative SCE/
- * homebrew reference for SceUserService's real ABI (not present in this
- * SDK), or evidence from someone who has gotten a real user id in this
- * SDK's ecosystem. Neither is available to this project right now.
+ * Compiled for PS5 and NOT yet run on real hardware as of this commit —
+ * see the handoff report / docs/testing.md for exactly what that means
+ * and what physical verification is still required.
  */
+#include "config/credentials.h"
+#include "download/download_manager.h"
+#include "download/downloader.h"
 #include "log/log.h"
-#include "storage/storage.h"
+#include "net/http_client.h"
+#include "net/http_client_ps5.h"
+#include "ps5/pad.h"
+#include "ps5/screens.h"
+#include "ps5/video.h"
+#include "romm_api/romm_api.h"
+#include "romm_api/romm_api_http.h"
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
-/* --- Prototypes copied verbatim (signatures) from
- * ps5-payload-dev/sdk v0.43 sample sources; see the file-level comment
- * above for exactly which sample each came from. --- */
-
-/* samples/browser/main.c — the only SDK-demonstrated UserService calls. */
+/* samples/browser/main.c — the only SDK-demonstrated UserService calls;
+ * confirmed working on real hardware (see docs/testing.md "First
+ * hardware test"). Needed before sceUserServiceGetLoginUserIdList
+ * (called from src/ps5/pad.c) can return anything meaningful. */
 int sceUserServiceInitialize(void *);
 int sceUserServiceTerminate(void);
 
-/* samples/notify/main.c */
-#define SCE_NOTIFICATION_LOCAL_USER_ID_SYSTEM 0xFE
-int sceNotificationSend(int userId, bool isLogged, const char *payload);
-
-/* samples/hwinfo/main.c */
+/* samples/hwinfo/main.c — confirmed working; kept as a cheap diagnostic
+ * line in the persistent log for hardware test reports. */
 int sceKernelGetHwModelName(char *);
 
-/* ScePad: real, confirmed-exported symbols (sce_stubs/libScePad.so), but
- * NOT demonstrated by any sample in this SDK. scePadInit takes no
- * arguments, so there is nothing about its call shape to get wrong.
- * scePadOpen/scePadClose follow the widely-published PS4/PS5 homebrew
- * convention (not SDK-verified) and are only called once a real user id
- * is available — which, per the investigation above, doesn't currently
- * happen. scePadReadState is deliberately never declared or called here:
- * its output struct's field layout is published nowhere in this SDK. */
-int32_t scePadInit(void);
-int32_t scePadOpen(int32_t userId, int32_t type, int32_t index,
-                   const void *pParam);
-int32_t scePadClose(int32_t handle);
+#define APP_DIR "/data/homebrew/RomM-PS5"
+#define CONFIG_PATH APP_DIR "/config.json"
+#define LOG_PATH APP_DIR "/romm-ps5.log"
+#define GAMES_DIR "/data/etaHEN/games"
 
-#define LOG_DIR "/data/romm-ps5"
-#define LOG_PATH LOG_DIR "/ps5-hello.log"
+#define LIBRARY_PAGE_LIMIT 500
+#define WAIT_FOR_INPUT_MAX_FRAMES 3600 /* bounded so a missing/dead pad
+                                         * can never hang shutdown */
+
+typedef struct {
+    Video *video;
+    PadState *pad;
+    const RommGame *game;
+    time_t last_draw_time;
+} DownloadUiContext;
+
+static void download_on_progress(const DownloadProgress *progress,
+                                  void *user_data) {
+    DownloadUiContext *ui = (DownloadUiContext *)user_data;
+    time_t now = time(NULL);
+    /* Redrawing (and thus flipping/vsync-waiting) on every received chunk
+     * would cap transfer throughput at the display's flip rate instead of
+     * the network's — throttle to roughly once per second, matching the
+     * granularity src/download/downloader.c already uses for its own
+     * speed_bytes_per_sec calculation. */
+    if (ui->last_draw_time == 0 || now != ui->last_draw_time) {
+        screen_draw_download(ui->video, ui->game, progress);
+        ui->last_draw_time = now;
+    }
+}
+
+static bool download_should_cancel(void *user_data) {
+    DownloadUiContext *ui = (DownloadUiContext *)user_data;
+    PadData pad_data;
+    memset(&pad_data, 0, sizeof(pad_data));
+    if (!pad_read(ui->pad, &pad_data)) {
+        return false;
+    }
+    return (pad_data.buttons & PAD_BUTTON_CIRCLE) != 0;
+}
+
+/* Redraws the already-drawn message screen while polling for Cross/Circle,
+ * so startup errors are visible and dismissable rather than the app just
+ * hanging or vanishing. Bounded to WAIT_FOR_INPUT_MAX_FRAMES so this exits
+ * cleanly even with no controller connected at all. */
+static void wait_for_confirm(Video *video, PadState *pad) {
+    uint32_t prev_buttons = 0;
+    for (int frame = 0; frame < WAIT_FOR_INPUT_MAX_FRAMES; frame++) {
+        PadData pad_data;
+        memset(&pad_data, 0, sizeof(pad_data));
+        bool have_pad = pad_read(pad, &pad_data);
+        uint32_t buttons = have_pad ? pad_data.buttons : 0;
+        uint32_t pressed = buttons & ~prev_buttons;
+        prev_buttons = buttons;
+
+        if (pressed & (PAD_BUTTON_CROSS | PAD_BUTTON_CIRCLE)) {
+            return;
+        }
+        if (!video_present(video)) {
+            return;
+        }
+    }
+    log_warn("wait_for_confirm: timed out after %d frames with no input",
+             WAIT_FOR_INPUT_MAX_FRAMES);
+}
 
 int main(void) {
     int32_t user_service_result = sceUserServiceInitialize(0);
     bool user_service_ready = (user_service_result == 0);
 
-    /* Directory creation is PS5-specific (the path itself is a PS5 detail)
-     * and stays here rather than in the platform-agnostic log module —
-     * see log.h. Ignored on failure/EEXIST; log_init_file_sink()'s own
-     * fopen() below is the real, observable check. */
-    mkdir(LOG_DIR, 0755);
+    mkdir(APP_DIR, 0755);
     log_init_file_sink(LOG_PATH);
-
-    log_info("RomM-PS5 PS5-target starting (cross-compilation milestone)");
+    log_info("RomM-PS5 starting (vertical-slice MVP)");
 
     log_info("sceUserServiceInitialize returned 0x%x (%d)",
              (unsigned int)user_service_result, (int)user_service_result);
     if (!user_service_ready) {
-        log_warn("sceUserServiceInitialize failed (nonfatal); treating "
-                 "UserService as unavailable for the rest of this run");
+        log_warn("sceUserServiceInitialize failed (nonfatal); DualSense "
+                 "user-id resolution will fall back to PAD_USER_ID_SYSTEM");
     }
 
     char model[256] = {0};
     if (sceKernelGetHwModelName(model) == 0 && model[0] != '\0') {
         log_info("Hardware model: %s", model);
-    } else {
-        log_warn("sceKernelGetHwModelName failed or returned an empty name");
     }
 
-    StorageDestination destinations[STORAGE_CANDIDATE_PATH_COUNT];
-    size_t found =
-        storage_discover(STORAGE_CANDIDATE_PATHS, STORAGE_CANDIDATE_PATH_COUNT,
-                         NULL, destinations, STORAGE_CANDIDATE_PATH_COUNT);
-    log_info("storage_discover: %zu of %zu candidate destinations exist "
-             "and are writable",
-             found, STORAGE_CANDIDATE_PATH_COUNT);
-    for (size_t i = 0; i < found; i++) {
-        log_info("  destination: %s (%llu bytes free)", destinations[i].path,
-                 (unsigned long long)destinations[i].free_bytes);
-    }
+    mkdir(GAMES_DIR, 0755);
 
-    static const char toast[] =
-        "{\n"
-        "  \"rawData\": {\n"
-        "    \"viewTemplateType\": \"InteractiveToastTemplateB\",\n"
-        "    \"channelType\": \"Downloads\",\n"
-        "    \"useCaseId\": \"IDC\",\n"
-        "    \"toastOverwriteType\": \"No\",\n"
-        "    \"isImmediate\": true,\n"
-        "    \"priority\": 100,\n"
-        "    \"viewData\": {\n"
-        "      \"icon\": {\n"
-        "        \"type\": \"Predefined\",\n"
-        "        \"parameters\": { \"icon\": \"download\" }\n"
-        "      },\n"
-        "      \"message\": { \"body\": \"RomM-PS5\" },\n"
-        "      \"subMessage\": { \"body\": \"PS5 cross-compile milestone "
-        "ELF ran successfully\" }\n"
-        "    }\n"
-        "  },\n"
-        "  \"createdDateTime\": \"2026-01-01T00:00:00.000Z\",\n"
-        "  \"localNotificationId\": \"1\"\n"
-        "}";
-
-    int notify_result =
-        sceNotificationSend(SCE_NOTIFICATION_LOCAL_USER_ID_SYSTEM, true, toast);
-    log_info("sceNotificationSend returned 0x%x (%d)",
-             (unsigned int)notify_result, notify_result);
-    if (notify_result != 0) {
-        log_warn("sceNotificationSend failed (nonfatal)");
-    } else {
-        log_info("Notification toast sent");
-    }
-
-    /* See the file-level comment: no SDK-verified way to obtain a real
-     * user id exists in this pinned SDK, so scePadOpen (which needs one)
-     * is never reached. scePadInit takes no arguments and is safe to call
-     * regardless. */
-    int32_t pad_init_result = scePadInit();
-    log_info("scePadInit returned 0x%x (%d)", (unsigned int)pad_init_result,
-             (int)pad_init_result);
-
-    bool have_verified_user_id = false; /* see file-level comment */
-    int32_t user_id = 0;
-    int32_t pad_handle = -1;
-    if (have_verified_user_id) {
-        pad_handle = scePadOpen(user_id, 0, 0, NULL);
-        log_info("scePadOpen returned 0x%x (%d) for user_id=%d",
-                 (unsigned int)pad_handle, (int)pad_handle, (int)user_id);
-        if (pad_handle >= 0) {
-            log_info("ScePad handle %d opened (state read intentionally "
-                     "not attempted — see docs/testing.md)",
-                     (int)pad_handle);
-        } else {
-            log_warn("scePadOpen failed (nonfatal)");
+    Video *video = video_init();
+    if (video == NULL) {
+        log_error("video_init failed; cannot show a UI, exiting");
+        log_close_file_sink();
+        if (user_service_ready) {
+            sceUserServiceTerminate();
         }
-    } else {
-        log_warn("scePadOpen skipped: no SDK-verified way to obtain a real "
-                 "user id was found in this pinned SDK (documented "
-                 "blocker, not a guessed workaround — see the file-level "
-                 "comment in src/ps5/main_ps5.c and docs/testing.md)");
+        return EXIT_FAILURE;
     }
 
-    /* Clean up whatever was actually initialized/opened, in reverse order. */
-    if (pad_handle >= 0) {
-        scePadClose(pad_handle);
-        log_info("scePadClose called for handle %d", (int)pad_handle);
+    PadState pad;
+    pad_init(&pad);
+    if (!pad_open(&pad)) {
+        log_warn("No DualSense available at startup; controller input will "
+                 "be unavailable until this app is restarted with one "
+                 "connected");
     }
 
-    log_info("RomM-PS5 PS5-target exiting cleanly");
+    screen_draw_message(video, "RomM-PS5", "Loading configuration...");
+
+    RommCredentials creds;
+    CredentialsResult cred_result = credentials_load(CONFIG_PATH, &creds);
+    if (cred_result != CREDENTIALS_OK) {
+        const char *body;
+        switch (cred_result) {
+        case CREDENTIALS_ERR_IO:
+            body = "Could not read " CONFIG_PATH
+                   " — create it with your RomM server_url and api_token.";
+            break;
+        case CREDENTIALS_ERR_PARSE:
+            body = CONFIG_PATH " is not valid JSON.";
+            break;
+        default:
+            body = CONFIG_PATH
+                " is missing \"server_url\" or \"api_token\".";
+            break;
+        }
+        log_error("credentials_load failed (%d): %s", cred_result, body);
+        screen_draw_message(video, "Configuration error", body);
+        wait_for_confirm(video, &pad);
+        goto shutdown;
+    }
+
+    screen_draw_message(video, "RomM-PS5", "Starting network...");
+    if (!http_client_ps5_startup()) {
+        log_error("http_client_ps5_startup failed");
+        screen_draw_message(video, "Network error",
+                             "Could not initialize PS5 networking "
+                             "(SceNet/SceSsl/SceHttp2). See the log.");
+        wait_for_confirm(video, &pad);
+        goto shutdown;
+    }
+
+    HttpClient http;
+    http_client_ps5_init(&http);
+
+    RommApiHttpContext api_ctx;
+    RommApi api;
+    romm_api_http_init(&api, &api_ctx, &http, creds.server_url,
+                        creds.api_token);
+
+    screen_draw_message(video, "RomM-PS5", "Connecting to RomM server...");
+
+    RommGamePage page;
+    memset(&page, 0, sizeof(page));
+    RommResult list_result = api.list_ps5_games(
+        api.ctx, NULL, ROMM_SORT_TITLE_ASC, 0, LIBRARY_PAGE_LIMIT, &page);
+    if (list_result != ROMM_OK) {
+        const char *body;
+        switch (list_result) {
+        case ROMM_ERR_AUTH:
+            body = "Authentication failed — check api_token in "
+                   CONFIG_PATH ".";
+            break;
+        case ROMM_ERR_NOT_FOUND:
+            body = "Server has no 'ps5' platform configured.";
+            break;
+        default:
+            body = "Could not reach the RomM server — check server_url and "
+                   "network connectivity.";
+            break;
+        }
+        log_error("list_ps5_games failed (%d): %s", list_result, body);
+        screen_draw_message(video, "Connection error", body);
+        wait_for_confirm(video, &pad);
+        goto shutdown;
+    }
+
+    log_info("Loaded %zu of %zu PS5 games from RomM", page.count, page.total);
+
+    /* Built locally rather than reading api_ctx.auth_header directly —
+     * romm_api_http.h documents that struct's fields as private to
+     * romm_api_http.c even though the header can't enforce that in C. */
+    char auth_header[ROMM_AUTH_HEADER_MAX];
+    snprintf(auth_header, sizeof(auth_header), "Bearer %s", creds.api_token);
+
+    DownloaderConfig dl_config = {
+        .http = &http,
+        .server_url = creds.server_url,
+        .auth_header = auth_header,
+        .dest_root = GAMES_DIR,
+    };
+
+    size_t focused_index = 0;
+    char status_line[192] = "";
+    uint32_t prev_buttons = 0;
+    bool running = true;
+
+    while (running) {
+        screen_draw_library(video, page.items, page.count, focused_index,
+                             status_line);
+
+        PadData pad_data;
+        memset(&pad_data, 0, sizeof(pad_data));
+        bool have_pad = pad_read(&pad, &pad_data);
+        uint32_t buttons = have_pad ? pad_data.buttons : 0;
+        uint32_t pressed = buttons & ~prev_buttons;
+        prev_buttons = buttons;
+
+        if (pressed & PAD_BUTTON_UP) {
+            if (focused_index > 0) {
+                focused_index--;
+            }
+        }
+        if (pressed & PAD_BUTTON_DOWN) {
+            if (page.count > 0 && focused_index + 1 < page.count) {
+                focused_index++;
+            }
+        }
+        if (pressed & PAD_BUTTON_CIRCLE) {
+            running = false;
+        }
+        if ((pressed & PAD_BUTTON_CROSS) && page.count > 0) {
+            const RommGame *game = &page.items[focused_index];
+
+            DownloadProgress progress;
+            download_progress_init(&progress);
+
+            DownloadUiContext ui_ctx = {
+                .video = video,
+                .pad = &pad,
+                .game = game,
+                .last_draw_time = 0,
+            };
+
+            log_info("Starting download: %s (id=%d)", game->title, game->id);
+            bool ok =
+                downloader_run(&dl_config, game, &progress,
+                                download_should_cancel, download_on_progress,
+                                &ui_ctx);
+
+            screen_draw_download(video, game, &progress);
+            wait_for_confirm(video, &pad);
+
+            if (ok) {
+                snprintf(status_line, sizeof(status_line),
+                         "Downloaded: %s", game->title);
+            } else if (progress.state == DL_STATE_CANCELLED) {
+                snprintf(status_line, sizeof(status_line), "Cancelled: %s",
+                         game->title);
+            } else {
+                snprintf(status_line, sizeof(status_line), "Failed: %s (%s)",
+                         game->title, progress.failure_reason);
+            }
+            prev_buttons = 0; /* avoid a stray Cross/Circle from the confirm
+                                * wait immediately re-triggering a list action */
+        }
+    }
+
+    api.list_ps5_games_free(&page);
+
+shutdown:
+    log_info("RomM-PS5 exiting cleanly");
+    pad_close(&pad);
+    video_shutdown(video);
+    http_client_ps5_shutdown();
 
     if (user_service_ready) {
         sceUserServiceTerminate();
     }
-
     log_close_file_sink();
 
     return EXIT_SUCCESS;

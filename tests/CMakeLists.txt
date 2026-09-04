@@ -10,6 +10,13 @@ add_executable(rommps5_tests
   test_storage.c
   test_config.c
   test_log_file_sink.c
+  test_url_encode.c
+  test_credentials.c
+  test_zip_extract.c
+  test_romm_api_http.c
+  test_downloader.c
+  synthetic_zip.c
+  mock_http_client.c
 )
 target_link_libraries(rommps5_tests PRIVATE rommps5_core)
 target_include_directories(rommps5_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
