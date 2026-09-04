@@ -8,6 +8,27 @@ so far is unreleased `nightly` development.
 
 ## [Unreleased]
 
+### Second hardware test — logging fix confirmed
+
+Retested the fixes below on the same console (CFI-1215A Z2X), using the
+canonical CI-built artifact from GitHub Actions run `33905275501` (commit
+`69bc48c`, SHA-256 `9f5ea26c...b1ffc5f9`). See `docs/testing.md` "Second
+hardware test" for full results.
+
+- **Persistent-logging fan-out fix confirmed on real hardware**:
+  `/data/romm-ps5/ps5-hello.log` now contains every line that appears over
+  TCP, including the `storage_discover` lines and the ScePad-skip warning
+  that were previously missing.
+- `sceUserServiceInitialize`, `sceNotificationSend`, and `scePadInit` all
+  logged `0x0 (0)` — confirms the hex/decimal logging works as designed,
+  and `scePadInit` itself does not fail on this console (its first real
+  data point; the first test never reached it).
+- The `"scePadOpen skipped: ..."` blocker message appeared exactly as
+  designed — confirms the skip logic is correct, but this is **not** the
+  same as controller input being verified. Real `ScePad` input
+  (`scePadOpen`/`scePadReadState`) remains an unresolved, untested
+  blocker.
+
 ### First hardware test, and fixes in response
 
 The PS5 cross-compilation milestone's artifact was run on real hardware for

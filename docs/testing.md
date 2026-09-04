@@ -5,8 +5,12 @@ and, just as importantly, what has not — following the project rule that
 AI-generated code is untrusted until reviewed, compiled, and tested, and
 that untested functionality must never be described as working.
 
-Status as of the SceUserService/logging fix milestone (follows the PS5
-cross-compilation milestone, which followed Milestone 1).
+Status as of the second hardware test (retest of the SceUserService/
+logging fix milestone, which followed the PS5 cross-compilation
+milestone, which followed Milestone 1). The persistent-logging fan-out
+fix is now hardware-confirmed; real `ScePad` controller input remains an
+unresolved, documented blocker — see below for the exact boundary between
+what is and isn't verified.
 
 ## First hardware test — RESULTS (real console)
 
@@ -84,12 +88,79 @@ Real DualSense/`ScePad` behavior — nothing about it was learned, since
 `scePadOpen` was never reached. See "Fixes applied" for what changed and
 what is still a documented, unresolved blocker rather than a fix.
 
-## Fixes applied in response — NOT YET HARDWARE-VERIFIED
+## Second hardware test — RESULTS (retest, logging fix confirmed)
 
-Everything in this section has been compiled, cross-compiled for PS5, and
-covered by new host-side tests. **None of it has been run on a console
-yet.** Do not treat it as hardware-confirmed until a retest happens — see
-this milestone's hardware retest handoff for the exact artifact to use.
+**Retest of the fixes below, on the same console.** Artifact: the
+*canonical CI-built* `rommps5-ps5` from GitHub Actions run
+[`33905275501`](https://github.com/Crimson3076/RomM-PS5/actions/runs/33905275501)
+(commit `69bc48c`), **SHA-256
+`9f5ea26cba4f6d4818158d774d7fd8fa59a6a1368094e17af82492368bacf8e9`**.
+Console: **CFI-1215A Z2X** (same unit as the first test). Delivery:
+`elfldr` over TCP port 9021.
+
+### Confirmed working on physical hardware (this retest)
+
+- The payload executed and exited cleanly, same as the first test.
+- `sceUserServiceInitialize` returned `0x0 (0)` — confirms the new
+  always-log-the-value-in-hex-and-decimal behavior works as designed on
+  real hardware, and that UserService init still succeeds on this console.
+- Hardware model detection succeeded (same as the first test).
+- `storage_discover` again found `/data/etaHEN/games` writable with
+  `515746824192` bytes free — identical to the first test, as expected
+  (same console, same storage state).
+- `sceNotificationSend` returned `0x0 (0)`.
+- `scePadInit` returned `0x0 (0)` — the first real data point on this
+  call's behavior on this console (the first test never reached it,
+  since the old code gated `scePadInit` behind the since-removed
+  `sceUserServiceGetInitialUser` call). This says `scePadInit()` itself
+  does not fail on this console; it says nothing about `scePadOpen` or
+  `scePadReadState`, which are still not called.
+- `scePadOpen` was skipped, logged exactly as
+  `"scePadOpen skipped: no SDK-verified way to obtain a real user id..."`
+  — **this confirms the documented-blocker behavior works exactly as
+  intended**: the code correctly recognizes it has no verified user id
+  and skips the guessed call, rather than either crashing or silently
+  attempting it.
+- TCP output contained the complete expected run (all lines from the
+  "Retest checklist" below were present and in order).
+- **`/data/romm-ps5/ps5-hello.log` now contains the complete timestamped
+  run, including every line that previously appeared over TCP but not in
+  the file (the `storage_discover` lines and the ScePad-skip warning).**
+  This is the specific regression the logging fan-out fix targeted, and
+  it is now **confirmed fixed on real hardware**, not just by host-side
+  tests using synthetic messages.
+
+**Persistent-log append behavior, confirmed as designed, not a bug**: the
+retrieved log file starts with the four un-timestamped lines left over
+from the first test (before the fan-out fix existed, and from a version
+of the code that didn't yet prefix lines with a timestamp), followed by
+the complete, fully-timestamped second run appended after them.
+`log_init_file_sink()` opens the file in append (`"a"`) mode by design —
+a durable diagnostic log is expected to accumulate across runs of the
+payload rather than being truncated each time, which is exactly what a
+"crash log location" needs to be useful after the fact. Anyone comparing
+raw byte counts between TCP output and the file should account for this:
+the file legitimately contains more than just the most recent run.
+
+### Still not verified (unchanged — do not treat as confirmed)
+
+- **Real controller input.** `scePadOpen` was correctly *skipped*, not
+  *exercised* — nothing about whether it would succeed, what a real user
+  id would need to look like, or `scePadReadState`'s behavior has been
+  learned. This remains a documented, unresolved blocker, not a working
+  feature.
+- Everything else already listed under "What has NOT been tested at all"
+  below that this retest didn't touch (real RomM integration, large
+  files, other consoles/firmware, etc.).
+
+## Fixes applied in response to the first hardware test — HARDWARE-VERIFIED
+
+Everything in this section was compiled, cross-compiled for PS5, and
+covered by new host-side tests, and has now also been **confirmed on real
+hardware** by the second hardware test above (console CFI-1215A Z2X,
+artifact SHA-256 `9f5ea26c...b1ffc5f9`). The one exception, called out
+inline below, is real `ScePad` controller input, which remains an
+unresolved, documented blocker — do not treat it as verified.
 
 - **`sceUserServiceGetInitialUser` investigation.** Directly inspected the
   pinned SDK (`ps5-payload-dev/sdk` v0.43): every sample's source, every
@@ -107,29 +178,42 @@ this milestone's hardware retest handoff for the exact artifact to use.
   the pinned SDK, to obtain a real user id from a raw `elfldr`-launched
   payload. See the file-level comment in `src/ps5/main_ps5.c` for the full
   investigation trail.
-- **Consequence for ScePad**: `scePadOpen`/`scePadClose` are only called
+- **Consequence for ScePad** — **the skip behavior is hardware-confirmed;
+  real ScePad input is NOT**: `scePadOpen`/`scePadClose` are only called
   when a verified user id is available — which, per the above, never
   happens right now, so they are skipped and logged as a documented
   blocker (`"scePadOpen skipped: no SDK-verified way to obtain a real
-  user id..."`) rather than attempted with a guessed value.
+  user id..."`) rather than attempted with a guessed value. The second
+  hardware test confirmed this exact log line appears and `scePadOpen` is
+  correctly never reached — but that only verifies the *skip logic*, not
+  controller input itself, which remains entirely untested.
   `scePadInit()` (which takes no arguments, so there is nothing about its
   call shape to guess) is still called unconditionally; its return value
-  is now logged in both hex and signed decimal.
+  is now logged in both hex and signed decimal, and the second hardware
+  test observed `0x0 (0)` — the first real data point on this call, though
+  it says nothing about `scePadOpen`/`scePadReadState`.
 - **`sceUserServiceInitialize`/`sceNotificationSend`/`scePadInit` return
   values are now all logged in both hex and signed decimal** (previously
   only pass/fail was logged for some of them), e.g.
-  `sceUserServiceInitialize returned 0x0 (0)`.
+  `sceUserServiceInitialize returned 0x0 (0)` — **confirmed on hardware**
+  in the second test (all three logged `0x0 (0)`).
 - **`sceUserServiceTerminate` is now only called if `sceUserServiceInitialize`
-  actually returned 0** — previously it was called unconditionally.
-- **Logging consolidated behind one API.** `src/log/log.c` now owns an
-  optional persistent-file sink (`log_init_file_sink()`/
-  `log_close_file_sink()`); every `log_message()` call (i.e. every
-  `log_info`/`log_warn`/`log_error`/`log_debug` in the whole codebase)
-  formats its line once and writes the identical bytes to both stderr and
-  the file sink (if open), flushing the file immediately on every line —
-  not buffered until shutdown. `src/ps5/main_ps5.c`'s previous hand-rolled
-  `logfile_line()` duplicate-logging helper was deleted entirely; nothing
-  in this project's own code calls `printf`/`fprintf` for application
+  actually returned 0** — previously it was called unconditionally. Not
+  independently observable from the TCP/log output (it produces no log
+  line of its own), so this remains verified by code review and host
+  compilation only, not by a distinguishing hardware observation.
+- **Logging consolidated behind one API — confirmed fixed on hardware.**
+  `src/log/log.c` now owns an optional persistent-file sink
+  (`log_init_file_sink()`/`log_close_file_sink()`); every `log_message()`
+  call (i.e. every `log_info`/`log_warn`/`log_error`/`log_debug` in the
+  whole codebase) formats its line once and writes the identical bytes to
+  both stderr and the file sink (if open), flushing the file immediately
+  on every line — not buffered until shutdown. The second hardware test
+  confirmed `/data/romm-ps5/ps5-hello.log` now contains every line that
+  appears over TCP, which is the specific defect this fixed.
+  `src/ps5/main_ps5.c`'s previous hand-rolled `logfile_line()`
+  duplicate-logging helper was deleted entirely; nothing in this
+  project's own code calls `printf`/`fprintf` for application
   diagnostics anymore (`config.c`'s file writes are config serialization,
   a different concern, and are unaffected). New host-side tests
   (`tests/test_log_file_sink.c`, 20 checks) cover: INFO/WARN/ERROR all
@@ -203,36 +287,22 @@ different-environment build's — they are legitimately different files.
 
 ## What has NOT been tested at all
 
-- **The fixes in this milestone, on real hardware.** The SceUserService
-  hex/decimal logging, the "skip ScePad, don't guess" blocker handling,
-  and the entire persistent-logging fan-out rewrite have only been
-  compiled (host + PS5 cross-compile) and covered by new host-side tests
-  — see "Fixes applied in response" above. **Not one byte of this
-  milestone's code has run on a console.** Do not describe any of it as
-  hardware-verified until a retest confirms it — see this milestone's
-  hardware retest handoff for the exact artifact and steps.
-- **Real `ScePad` behavior, still entirely unknown.** The first hardware
-  test never reached `scePadOpen` at all (see "First hardware test"
-  above), and this milestone's fix makes that skip deliberate rather than
-  accidental — it does not make ScePad work. Whether `scePadInit()`
-  itself behaves sanely on this console, and whether any path to a real
-  user id (and therefore `scePadOpen`) exists at all, remain completely
-  open questions. `scePadReadState` (actual button/stick state) is still
-  never called at all — deliberately deferred; see `docs/building.md`
-  "Input mapping".
+- **Real `ScePad` behavior, still entirely unknown.** Both hardware tests
+  confirm `scePadOpen` is correctly *skipped* (see "Second hardware test"
+  above) — that is not the same as it being tested. Whether any path to a
+  real, verified user id (and therefore `scePadOpen`) exists at all
+  remains a completely open question, and `scePadReadState` (actual
+  button/stick state) is still never called at all — deliberately
+  deferred; see `docs/building.md` "Input mapping". `scePadInit()` itself
+  is now observed to return `0x0 (0)` on this one console (second
+  hardware test), which is the only real ScePad-adjacent data point that
+  exists.
   - DualSense input via the host-only `SDL_GameController` path is
     irrelevant to the PS5 target (it's host-build-only, see
     `docs/building.md`) and remains desktop-only-tested regardless.
   - PS5 firmware version/compatibility beyond "targets 10.60" per the
     project's stated scope — this milestone's console is one data point,
     not a compatibility sweep.
-- **Whether the fixed persistent log is actually complete on hardware.**
-  The host-side tests (`test_log_file_sink.c`) prove the fan-out mechanism
-  works correctly in general, using synthetic messages shaped like the
-  real ones — they cannot prove the *actual* `/data/romm-ps5/ps5-hello.log`
-  produced by a real run on this console now matches the real TCP output
-  line-for-line. That specific comparison is exactly what the hardware
-  retest handoff below asks for.
 - **Real RomM server integration.** No live RomM instance was reachable
   from this environment; the API endpoint/behavior findings in
   `docs/architecture.md` §3 come from reading RomM's own backend source,
@@ -272,36 +342,39 @@ Milestone 2 (RomM connection) and Milestone 3 (safe test download).
 3. ~~A "RomM-PS5" toast notification appears on screen.~~ ✅
 4. ~~Log lines appear in the terminal running the deploy command.~~ ✅
 5. ~~`/data/romm-ps5/ps5-hello.log` exists on the console afterward.~~ ✅
-   (though incomplete — see "Fixes applied", now addressed but unverified)
+   (though incomplete at the time — fixed and confirmed by the retest below)
 6. `scePadOpen` reports a plausible (non-negative) handle when a DualSense
    is connected. ❌ **Not reached** — blocked by the `sceUserServiceGetInitialUser`
-   failure; still not reached after this milestone's fix either, since
-   that fix documents the blocker rather than resolving it.
+   failure; still not reached after the fix either, since the fix
+   documents the blocker rather than resolving it (confirmed again by the
+   retest below).
 7. ~~The process actually exits cleanly.~~ ✅
 
-### Retest checklist — for the artifact produced by THIS milestone
+### Retest checklist — DONE (see "Second hardware test — RESULTS" above)
 
-Not yet run. See the hardware retest handoff (this milestone's session
-report) for the exact artifact, deploy command, and expected output. Confirm:
-1. The artifact still runs to completion without crashing.
-2. `sceUserServiceInitialize returned 0x... (...)` is logged (hex + decimal
-   both present) — expect the same success as before (`0x0 (0)`), now just
-   logged explicitly instead of only on failure.
-3. `scePadInit returned 0x... (...)` is logged.
-4. The `"scePadOpen skipped: no SDK-verified way..."` warning appears —
-   confirms the code no longer calls the unverified
+Console: CFI-1215A Z2X (same unit). Artifact: CI-built `rommps5-ps5`,
+SHA-256 `9f5ea26cba4f6d4818158d774d7fd8fa59a6a1368094e17af82492368bacf8e9`
+(GitHub Actions run `33905275501`, commit `69bc48c`). Firmware version not
+separately recorded for this retest (same console as the first test).
+
+1. ~~The artifact still runs to completion without crashing.~~ ✅
+2. ~~`sceUserServiceInitialize returned 0x... (...)` is logged.~~ ✅
+   `0x0 (0)`, same success as the first test, now logged explicitly.
+3. ~~`scePadInit returned 0x... (...)` is logged.~~ ✅ `0x0 (0)` — the
+   first real data point on this call (never reached in the first test).
+4. ~~The `"scePadOpen skipped: no SDK-verified way..."` warning appears.~~
+   ✅ Confirms the code no longer calls the unverified
    `sceUserServiceGetInitialUser` function at all.
-5. **The persistent log file now contains every line that appeared over
-   TCP**, including the `storage_discover` lines and the ScePad-skip
-   warning — this is the specific regression this milestone fixed; retest
-   must confirm the fix, not just that the app still runs.
-6. The notification toast, hardware model log, and storage-discovery
-   result are unchanged from the first test (same console, same expected
-   values).
-7. The process still exits cleanly and the loader is ready for another
-   payload afterward.
+5. ~~The persistent log file now contains every line that appeared over
+   TCP.~~ ✅ **Confirmed fixed** — including the `storage_discover` lines
+   and the ScePad-skip warning. This was the specific regression this
+   milestone targeted.
+6. ~~The notification toast, hardware model log, and storage-discovery
+   result are unchanged from the first test.~~ ✅ Identical values
+   (same console, same storage state).
+7. ~~The process still exits cleanly and the loader is ready for another
+   payload afterward.~~ ✅
 
-Record the result of each step (and the console's firmware version) here
-once it's been tried, rather than only in a session report, so this file
-stays the single source of truth for what's actually been confirmed on
-hardware.
+**Not covered by this retest, still open**: real `ScePad` controller
+input (`scePadOpen`/`scePadReadState`) — see "What has NOT been tested at
+all" above. Do not treat controller input as verified.
