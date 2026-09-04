@@ -1,5 +1,6 @@
 #include "ps5/tilemap.h"
 
+#include <stdint.h>
 #include <stdlib.h>
 
 /* --- Tiling constants and address math: copied from
@@ -39,9 +40,60 @@ static uint32_t tile_pixel(uint32_t x, uint32_t y, uint32_t width) {
 }
 
 size_t tilemap_buffer_size(uint32_t width, uint32_t height) {
-    uint32_t last_band = ((height - 1) / TILE_HEIGHT) * (TILE_HEIGHT * width);
-    uint32_t last_tile = ((width - 1) / TILE_WIDTH) * TILE_SIZE;
-    return (size_t)(last_band + last_tile + TILE_SIZE) * sizeof(uint32_t);
+    if (width == 0 || height == 0) {
+        return 0;
+    }
+
+    size_t band_count = ((size_t)height - 1) / TILE_HEIGHT;
+    size_t band_pixels = (size_t)TILE_HEIGHT * width;
+    if (band_count != 0 && band_pixels > SIZE_MAX / band_count) {
+        return 0;
+    }
+    size_t last_band = band_count * band_pixels;
+
+    size_t tile_count = ((size_t)width - 1) / TILE_WIDTH;
+    if (tile_count > SIZE_MAX / TILE_SIZE) {
+        return 0;
+    }
+    size_t last_tile = tile_count * TILE_SIZE;
+
+    if (last_band > SIZE_MAX - last_tile ||
+        last_band + last_tile > SIZE_MAX - TILE_SIZE) {
+        return 0;
+    }
+    size_t pixels = last_band + last_tile + TILE_SIZE;
+    if (pixels > SIZE_MAX / sizeof(uint32_t)) {
+        return 0;
+    }
+    return pixels * sizeof(uint32_t);
+}
+
+bool tilemap_buffer_layout(uint32_t width, uint32_t height, size_t alignment,
+                           size_t buffer_count, size_t *buffer_stride,
+                           size_t *total_size) {
+    if (alignment == 0 || buffer_count == 0 || buffer_stride == NULL ||
+        total_size == NULL) {
+        return false;
+    }
+
+    size_t raw_size = tilemap_buffer_size(width, height);
+    if (raw_size == 0) {
+        return false;
+    }
+
+    size_t remainder = raw_size % alignment;
+    size_t padding = remainder == 0 ? 0 : alignment - remainder;
+    if (raw_size > SIZE_MAX - padding) {
+        return false;
+    }
+    size_t stride = raw_size + padding;
+    if (stride > SIZE_MAX / buffer_count) {
+        return false;
+    }
+
+    *buffer_stride = stride;
+    *total_size = stride * buffer_count;
+    return true;
 }
 
 Tilemap *tilemap_create(uint32_t width, uint32_t height) {

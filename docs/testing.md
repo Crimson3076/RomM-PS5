@@ -5,12 +5,44 @@ and, just as importantly, what has not — following the project rule that
 AI-generated code is untrusted until reviewed, compiled, and tested, and
 that untested functionality must never be described as working.
 
-Status as of the second hardware test (retest of the SceUserService/
-logging fix milestone, which followed the PS5 cross-compilation
-milestone, which followed Milestone 1). The persistent-logging fan-out
-fix is now hardware-confirmed; real `ScePad` controller input remains an
-unresolved, documented blocker — see below for the exact boundary between
-what is and isn't verified.
+Status as of the third hardware test (first vertical-slice UI attempt). The
+persistent-logging fan-out fix remains hardware-confirmed. The new application
+reached `video_init()` but could not allocate its fixed 64 MiB direct-memory
+block, so graphics, real `ScePad` input, networking, and RomM integration were
+not reached. See below for the exact boundary between what is and is not
+verified.
+
+## Third hardware test - RESULTS (vertical-slice UI attempt)
+
+Console: **CFI-1215A Z2X**. Delivery: `elfldr` over TCP port 9021. Artifact:
+the canonical CI-built `rommps5-ps5` from GitHub Actions run
+[`33911597953`](https://github.com/Crimson3076/RomM-PS5/actions/runs/33911597953)
+(commit `1344b15`), SHA-256
+`4006d50e4d279e3b30b06f017012b790eeb64333889118fb8a6a90b3ea36f01a`.
+
+### Confirmed on physical hardware
+
+- The vertical-slice ELF was accepted by `elfldr`, started, initialized
+  UserService, detected the hardware model, and exited cleanly after the video
+  error.
+- `sceVideoOutOpen` returned a non-negative handle because execution advanced
+  to the following direct-memory allocation.
+- The fixed `0x4000000` (64 MiB) `sceKernelAllocateMainDirectMemory` request
+  failed with `errno` reported as `Resource temporarily unavailable`.
+- No UI appeared. Configuration, networking, RomM access, and real controller
+  input were not reached, so this test provides no evidence about them.
+
+### Fix prepared in response, not yet hardware-verified
+
+- The two scanout buffers now use an overflow-checked, alignment-aware layout
+  calculated from `tilemap_buffer_size()`. At 1920x1080 this requests
+  `0x880000` bytes per buffer and `0x1100000` bytes total, approximately 17
+  MiB, instead of the reference backend's fixed 64 MiB reservation.
+- Every video initialization boundary now logs its SCE return value in
+  hexadecimal and decimal plus `errno` where applicable. Allocation logs also
+  include size, alignment, and memory type.
+- Host tests assert the exact 1080p and 720p tiled-buffer layouts and reject
+  invalid or overflowing calculations.
 
 ## First hardware test — RESULTS (real console)
 

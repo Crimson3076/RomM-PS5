@@ -15,6 +15,7 @@ add_executable(rommps5_tests
   test_zip_extract.c
   test_romm_api_http.c
   test_downloader.c
+  test_tilemap.c
   synthetic_zip.c
   mock_http_client.c
 )

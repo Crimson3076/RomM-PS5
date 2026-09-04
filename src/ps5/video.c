@@ -3,6 +3,7 @@
 #include "log/log.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h> /* u_short/u_int, needed by sys/event.h below but not
@@ -50,14 +51,15 @@ int sceVideoOutRegisterBuffers2(int, int, int, VideoBuf *, int, VideoAttr *,
                                  int, void *);
 
 #define VIDEO_BUFFER_ATTR_MAGIC 0x8000000022000000UL
-#define VIDEO_MEMSIZE 0x4000000
 #define VIDEO_MEM_ALIGN 0x20000
+#define VIDEO_BUFFER_COUNT 2
 
 struct Video {
     int handle;
     VideoBuf vbuf[2];
     struct kevent *evt_queue;
     intptr_t paddr;
+    size_t buffer_stride;
     size_t memsize;
     Tilemap *tmap;
     uint32_t *pixels; /* linear CPU-side ABGR8888 draw buffer */
@@ -72,56 +74,109 @@ Video *video_init(void) {
     }
     video->handle = -1;
 
-    sceSystemServiceHideSplashScreen();
+    int rc = sceSystemServiceHideSplashScreen();
+    log_info("sceSystemServiceHideSplashScreen returned 0x%08x (%d)",
+             (unsigned int)rc, rc);
 
     video->handle = sceVideoOutOpen(0xff, 0, 0, NULL);
     if (video->handle < 0) {
-        log_error("sceVideoOutOpen failed: %d", video->handle);
+        int saved_errno = errno;
+        log_error("sceVideoOutOpen failed: rc=0x%08x (%d), errno=%d (%s)",
+                  (unsigned int)video->handle, video->handle, saved_errno,
+                  strerror(saved_errno));
         free(video);
         return NULL;
     }
+    log_info("sceVideoOutOpen returned handle=%d", video->handle);
 
-    video->memsize = VIDEO_MEMSIZE;
-    if (sceKernelAllocateMainDirectMemory(video->memsize, VIDEO_MEM_ALIGN, 3,
-                                           &video->paddr)) {
-        log_error("sceKernelAllocateMainDirectMemory failed: %s",
-                  strerror(errno));
+    if (!tilemap_buffer_layout(VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_MEM_ALIGN,
+                               VIDEO_BUFFER_COUNT, &video->buffer_stride,
+                               &video->memsize)) {
+        log_error("video_init: invalid framebuffer allocation layout for %dx%d",
+                  VIDEO_WIDTH, VIDEO_HEIGHT);
         sceVideoOutClose(video->handle);
         free(video);
         return NULL;
     }
+    log_info("Video direct-memory request: %zu bytes total, %zu bytes per "
+             "buffer, alignment=%u, buffers=%d",
+             video->memsize, video->buffer_stride,
+             (unsigned int)VIDEO_MEM_ALIGN, VIDEO_BUFFER_COUNT);
+
+    errno = 0;
+    rc = sceKernelAllocateMainDirectMemory(video->memsize, VIDEO_MEM_ALIGN, 3,
+                                            &video->paddr);
+    if (rc != 0) {
+        int saved_errno = errno;
+        log_error("sceKernelAllocateMainDirectMemory failed: rc=0x%08x (%d), "
+                  "errno=%d (%s), size=%zu, alignment=%u, type=3",
+                  (unsigned int)rc, rc, saved_errno, strerror(saved_errno),
+                  video->memsize, (unsigned int)VIDEO_MEM_ALIGN);
+        sceVideoOutClose(video->handle);
+        free(video);
+        return NULL;
+    }
+    log_info("sceKernelAllocateMainDirectMemory succeeded: paddr=0x%" PRIxPTR,
+             (uintptr_t)video->paddr);
 
     void *vaddr = NULL;
-    if (sceKernelMapDirectMemory(&vaddr, video->memsize, 0x33, 0,
-                                  video->paddr, VIDEO_MEM_ALIGN)) {
-        log_error("sceKernelMapDirectMemory failed: %s", strerror(errno));
+    errno = 0;
+    rc = sceKernelMapDirectMemory(&vaddr, video->memsize, 0x33, 0,
+                                   video->paddr, VIDEO_MEM_ALIGN);
+    if (rc != 0) {
+        int saved_errno = errno;
+        log_error("sceKernelMapDirectMemory failed: rc=0x%08x (%d), errno=%d "
+                  "(%s), size=%zu, alignment=%u",
+                  (unsigned int)rc, rc, saved_errno, strerror(saved_errno),
+                  video->memsize, (unsigned int)VIDEO_MEM_ALIGN);
         sceKernelReleaseDirectMemory(video->paddr, video->memsize);
         sceVideoOutClose(video->handle);
         free(video);
         return NULL;
     }
+    log_info("sceKernelMapDirectMemory succeeded: vaddr=%p", vaddr);
 
     video->vbuf[0].data = vaddr;
-    video->vbuf[1].data = (uint8_t *)vaddr + (video->memsize / 2);
+    video->vbuf[1].data = (uint8_t *)vaddr + video->buffer_stride;
 
-    if (sceKernelCreateEqueue(&video->evt_queue, "rommps5 flip queue")) {
-        log_error("sceKernelCreateEqueue failed: %s", strerror(errno));
+    errno = 0;
+    rc = sceKernelCreateEqueue(&video->evt_queue, "rommps5 flip queue");
+    if (rc != 0) {
+        int saved_errno = errno;
+        log_error("sceKernelCreateEqueue failed: rc=0x%08x (%d), errno=%d "
+                  "(%s)",
+                  (unsigned int)rc, rc, saved_errno, strerror(saved_errno));
         sceKernelReleaseDirectMemory(video->paddr, video->memsize);
         sceVideoOutClose(video->handle);
         free(video);
         return NULL;
     }
+    log_info("sceKernelCreateEqueue succeeded");
 
-    if (sceVideoOutAddFlipEvent(video->evt_queue, video->handle, NULL)) {
-        log_error("sceVideoOutAddFlipEvent failed: %s", strerror(errno));
+    errno = 0;
+    rc = sceVideoOutAddFlipEvent(video->evt_queue, video->handle, NULL);
+    if (rc != 0) {
+        int saved_errno = errno;
+        log_error("sceVideoOutAddFlipEvent failed: rc=0x%08x (%d), errno=%d "
+                  "(%s)",
+                  (unsigned int)rc, rc, saved_errno, strerror(saved_errno));
         sceKernelDeleteEqueue(video->evt_queue);
         sceKernelReleaseDirectMemory(video->paddr, video->memsize);
         sceVideoOutClose(video->handle);
         free(video);
         return NULL;
     }
-    if (sceVideoOutSetFlipRate(video->handle, 0)) {
-        log_warn("sceVideoOutSetFlipRate failed: %s", strerror(errno));
+    log_info("sceVideoOutAddFlipEvent succeeded");
+
+    errno = 0;
+    rc = sceVideoOutSetFlipRate(video->handle, 0);
+    if (rc != 0) {
+        int saved_errno = errno;
+        log_warn("sceVideoOutSetFlipRate failed: rc=0x%08x (%d), errno=%d "
+                 "(%s)",
+                 (unsigned int)rc, rc, saved_errno, strerror(saved_errno));
+    } else {
+        log_info("sceVideoOutSetFlipRate succeeded");
     }
 
     VideoAttr vattr;
@@ -129,9 +184,14 @@ Video *video_init(void) {
     sceVideoOutSetBufferAttribute2(&vattr, VIDEO_BUFFER_ATTR_MAGIC, 0,
                                     VIDEO_WIDTH, VIDEO_HEIGHT, 0, 0, 0);
 
-    if (sceVideoOutRegisterBuffers2(video->handle, 0, 0, video->vbuf, 2,
-                                     &vattr, 0, NULL)) {
-        log_error("sceVideoOutRegisterBuffers2 failed: %s", strerror(errno));
+    errno = 0;
+    rc = sceVideoOutRegisterBuffers2(video->handle, 0, 0, video->vbuf,
+                                      VIDEO_BUFFER_COUNT, &vattr, 0, NULL);
+    if (rc != 0) {
+        int saved_errno = errno;
+        log_error("sceVideoOutRegisterBuffers2 failed: rc=0x%08x (%d), "
+                  "errno=%d (%s)",
+                  (unsigned int)rc, rc, saved_errno, strerror(saved_errno));
         sceVideoOutDeleteFlipEvent(video->evt_queue, video->handle);
         sceKernelDeleteEqueue(video->evt_queue);
         sceKernelReleaseDirectMemory(video->paddr, video->memsize);
@@ -139,6 +199,7 @@ Video *video_init(void) {
         free(video);
         return NULL;
     }
+    log_info("sceVideoOutRegisterBuffers2 succeeded");
 
     video->tmap = tilemap_create(VIDEO_WIDTH, VIDEO_HEIGHT);
     video->pixels = calloc((size_t)VIDEO_WIDTH * VIDEO_HEIGHT, sizeof(uint32_t));

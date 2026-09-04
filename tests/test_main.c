@@ -14,6 +14,7 @@ void test_config_credentials(TestCounters *tc);
 void test_zip_extract(TestCounters *tc);
 void test_romm_api_http(TestCounters *tc);
 void test_downloader(TestCounters *tc);
+void test_tilemap(TestCounters *tc);
 
 typedef struct {
     const char *name;
@@ -34,6 +35,7 @@ int main(void) {
         {"zip_extract", test_zip_extract},
         {"romm_api_http", test_romm_api_http},
         {"downloader", test_downloader},
+        {"tilemap", test_tilemap},
     };
     size_t test_count = sizeof(tests) / sizeof(tests[0]);
 

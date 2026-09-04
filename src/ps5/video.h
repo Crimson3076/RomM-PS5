@@ -6,17 +6,18 @@
  * sceKernelCreateEqueue, sceVideoOutAddFlipEvent, sceVideoOutSetFlipRate,
  * sceVideoOutSetBufferAttribute2, sceVideoOutRegisterBuffers2,
  * sceVideoOutSubmitFlip, sceKernelWaitEqueue, and their matching
- * Close/Release/Delete calls) is copied from ps5-payload-dev/SDL's real,
- * working PS5 video backend (src/video/ps5/SDL_ps5video.c, zlib licensed
- * — see third_party/THIRD_PARTY_LICENSES.md), including the exact
- * argument values that source uses (buffer attribute magic constant
- * 0x8000000022000000UL, 0x4000000-byte/2-buffer allocation, 1920x1080
- * ABGR8888) — not guessed or re-derived. This project only replaces
- * SDL's window/surface machinery with a single fixed-size CPU-side pixel
- * buffer that the caller draws into directly and presents with
+ * Close/Release/Delete calls) is adapted from ps5-payload-dev/SDL's real,
+ * working PS5 video backend (src/video/ps5/SDL_ps5video.c, zlib licensed;
+ * see third_party/THIRD_PARTY_LICENSES.md). The buffer attribute magic and
+ * 1920x1080 ABGR8888 layout match that reference. Unlike SDL's fixed 64 MiB
+ * reservation, this project allocates the exact aligned size calculated by
+ * tilemap_buffer_layout(). A raw elfldr hardware test showed that the larger
+ * reservation was unavailable in this execution context. This project only
+ * replaces SDL's window/surface machinery with a single fixed-size CPU-side
+ * pixel buffer that the caller draws into directly and presents with
  * video_present().
  *
- * Compiled for PS5 and NOT yet run on real hardware — see docs/testing.md.
+ * See docs/testing.md for the exact hardware-verification boundary.
  */
 #ifndef ROMM_PS5_VIDEO_H
 #define ROMM_PS5_VIDEO_H

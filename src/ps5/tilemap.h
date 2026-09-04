@@ -11,6 +11,7 @@
 #ifndef ROMM_PS5_TILEMAP_H
 #define ROMM_PS5_TILEMAP_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -22,6 +23,14 @@ typedef struct Tilemap Tilemap;
 
 /* Bytes needed for a tiled buffer holding a width x height ABGR8888 image. */
 size_t tilemap_buffer_size(uint32_t width, uint32_t height);
+
+/* Calculates an allocation layout for one or more tiled buffers. Each buffer
+ * starts at `alignment`, so callers must use `buffer_stride` rather than
+ * dividing `total_size` to locate later buffers. Returns false for zero/invalid
+ * arguments or if any size calculation would overflow. */
+bool tilemap_buffer_layout(uint32_t width, uint32_t height, size_t alignment,
+                           size_t buffer_count, size_t *buffer_stride,
+                           size_t *total_size);
 
 Tilemap *tilemap_create(uint32_t width, uint32_t height);
 void tilemap_destroy(Tilemap *tmap);

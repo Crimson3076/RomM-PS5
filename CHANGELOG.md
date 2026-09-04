@@ -8,6 +8,23 @@ so far is unreleased `nightly` development.
 
 ## [Unreleased]
 
+### Third hardware test - video direct-memory allocation fix
+
+The first vertical-slice artifact reached `video_init()` on a CFI-1215A Z2X
+but its fixed 64 MiB `sceKernelAllocateMainDirectMemory` request failed with
+`Resource temporarily unavailable`. The payload exited cleanly before any UI,
+controller, networking, or RomM behavior could be tested.
+
+- Replaced the fixed 64 MiB allocation with an overflow-checked calculation
+  based on the actual tiled framebuffer size and alignment. Two 1920x1080
+  buffers now request exactly `0x1100000` bytes (17 MiB).
+- Added host tests for 1920x1080 and 1280x720 layouts plus invalid and overflow
+  cases.
+- Added return-code, `errno`, requested-size, alignment, and stage-success
+  diagnostics throughout PS5 video initialization.
+- This fix is compiled and host-tested but still requires a physical hardware
+  retest before video output can be described as working.
+
 ### Second hardware test — logging fix confirmed
 
 Retested the fixes below on the same console (CFI-1215A Z2X), using the
