@@ -32,7 +32,6 @@ along with this program; see the file COPYING. If not, see
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <dlfcn.h>
 #ifdef __FreeBSD__
 #include <sys/sysctl.h>
 #endif
@@ -81,8 +80,6 @@ _Static_assert(sizeof(playgo_info_t) == 9984, "PlayGo ABI size");
 int sceAppInstUtilInitialize(void);
 int sceAppInstUtilInstallByPackage(const pkg_metadata_t*, pkg_info_t*,
                                     playgo_info_t*);
-typedef int (*app_install_pkg_fn)(const char*, pkg_info_t*);
-
 #define SHELLCORE_AUTHID 0x3800000000000010ULL
 #define SYSTEM_INSTALL_AUTHID 0x4801000000000013ULL
 
@@ -187,6 +184,9 @@ typedef struct {
 
 static transfer_job_t transfer_job = {.rom_id = -1};
 static pthread_mutex_t transfer_lock = PTHREAD_MUTEX_INITIALIZER;
+/* The installer reaches this file through the loopback HTTP endpoint. Only
+   one transfer job exists, so one pinned path is sufficient. */
+static char installer_pkg_path[600];
 
 static void
 transfer_message(const char *message) {
@@ -943,6 +943,109 @@ serve_page(int client_fd, const config_t *cfg, const char *auth_b64,
 }
 
 
+
+static const char *
+header_value(const char *headers, const char *name) {
+  size_t name_len = strlen(name);
+  const char *line = headers;
+  while (line && *line) {
+    const char *end = strstr(line, "\r\n");
+    size_t len = end ? (size_t)(end - line) : strlen(line);
+    if (len > name_len && !strncasecmp(line, name, name_len) &&
+        line[name_len] == ':') {
+      line += name_len + 1;
+      while (*line == ' ' || *line == '\t') line++;
+      return line;
+    }
+    if (!end || end == line) break;
+    line = end + 2;
+  }
+  return NULL;
+}
+
+/* Serve the already verified PKG back to Sony's installer as an actual HTTP
+   source. AppInst/PlayGo on some firmware rejects a bare local path even
+   though it accepts a loopback URL. Byte ranges are required by PlayGo. */
+static void
+serve_installer_pkg(int client_fd, const char *headers, int head_only) {
+  char path[sizeof installer_pkg_path];
+  char response[512], buf[65536];
+  const char *range;
+  struct stat st;
+  FILE *fp;
+  unsigned long long size, start = 0, end, remaining;
+  int partial = 0, response_len;
+
+  snprintf(path, sizeof path, "%s", installer_pkg_path);
+  if (!path[0] || stat(path, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+    const char not_found[] =
+      "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    send_all(client_fd, not_found, sizeof not_found - 1);
+    close(client_fd);
+    return;
+  }
+  size = (unsigned long long)st.st_size;
+  end = size - 1;
+  range = header_value(headers, "Range");
+  if (range && !strncasecmp(range, "bytes=", 6)) {
+    char *tail;
+    errno = 0;
+    start = strtoull(range + 6, &tail, 10);
+    if (errno || tail == range + 6 || *tail != '-' || start >= size) {
+      response_len = snprintf(response, sizeof response,
+        "HTTP/1.1 416 Range Not Satisfiable\r\n"
+        "Content-Range: bytes */%llu\r\nContent-Length: 0\r\n"
+        "Connection: close\r\n\r\n", size);
+      send_all(client_fd, response, (size_t)response_len);
+      close(client_fd);
+      return;
+    }
+    tail++;
+    if (*tail >= '0' && *tail <= '9') {
+      unsigned long long requested_end = strtoull(tail, &tail, 10);
+      if (requested_end < start) {
+        close(client_fd);
+        return;
+      }
+      if (requested_end < end) end = requested_end;
+    }
+    partial = 1;
+  }
+  remaining = end - start + 1;
+  if (partial) {
+    response_len = snprintf(response, sizeof response,
+      "HTTP/1.1 206 Partial Content\r\n"
+      "Content-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\n"
+      "Content-Range: bytes %llu-%llu/%llu\r\nContent-Length: %llu\r\n"
+      "Connection: close\r\n\r\n", start, end, size, remaining);
+  } else {
+    response_len = snprintf(response, sizeof response,
+      "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+      "Accept-Ranges: bytes\r\nContent-Length: %llu\r\n"
+      "Connection: close\r\n\r\n", size);
+  }
+  if (send_all(client_fd, response, (size_t)response_len) || head_only) {
+    close(client_fd);
+    return;
+  }
+  fp = fopen(path, "rb");
+  if (!fp || fseeko(fp, (off_t)start, SEEK_SET)) {
+    if (fp) fclose(fp);
+    close(client_fd);
+    return;
+  }
+  printf("[pkg-http] %s bytes=%llu-%llu/%llu\n",
+         partial ? "range" : "full", start, end, size);
+  while (remaining) {
+    size_t want = remaining > sizeof buf ? sizeof buf : (size_t)remaining;
+    size_t got = fread(buf, 1, want, fp);
+    if (!got || send_all(client_fd, buf, got)) break;
+    remaining -= got;
+  }
+  fclose(fp);
+  close(client_fd);
+}
+
 static void
 send_html_page(int client_fd, const char *html, size_t html_len) {
   char header[256];
@@ -1182,24 +1285,11 @@ run_transfer(void *unused) {
     }
     installer_initialized = 1;
   }
-  {
-    app_install_pkg_fn install_local =
-      (app_install_pkg_fn)dlsym(RTLD_DEFAULT, "sceAppInstUtilAppInstallPkg");
-    if (install_local) {
-      printf("[install] trying sceAppInstUtilAppInstallPkg for local PKG\n");
-      err = install_local(dest_path, &pkginfo);
-      printf("[install] sceAppInstUtilAppInstallPkg -> 0x%x\n", err);
-    } else {
-      printf("[install] sceAppInstUtilAppInstallPkg is not exported; using fallback\n");
-      err = -1;
-    }
-    if (err) {
-      memset(&pkginfo, 0, sizeof pkginfo);
-      printf("[install] falling back to sceAppInstUtilInstallByPackage\n");
-      err = sceAppInstUtilInstallByPackage(&metainfo, &pkginfo, &playgoinfo);
-      printf("[install] sceAppInstUtilInstallByPackage -> 0x%x\n", err);
-    }
-  }
+  snprintf(installer_pkg_path, sizeof installer_pkg_path, "%s", dest_path);
+  metainfo.uri = "http://127.0.0.1:" UI_PORT "/pkg";
+  printf("[install] submitting loopback URI=%s\n", metainfo.uri);
+  err = sceAppInstUtilInstallByPackage(&metainfo, &pkginfo, &playgoinfo);
+  printf("[install] sceAppInstUtilInstallByPackage(loopback) -> 0x%x\n", err);
   installer_auth_release(saved_authid);
   printf("[install] returned content_id=%.48s type=%d platform=%d\n",
          pkginfo.content_id, pkginfo.type, pkginfo.platform);
@@ -1339,7 +1429,9 @@ main() {
     char req[REQ_BUF_SIZE];
     ssize_t n;
     char *line_end;
+    const char *headers = "";
     char path[32];
+    int head_only = 0;
     long platform_id;
     long offset;
     long rom_id;
@@ -1348,7 +1440,14 @@ main() {
       continue;
     }
 
-    n = recv(client_fd, req, sizeof req - 1, 0);
+    n = 0;
+    while ((size_t)n < sizeof req - 1) {
+      ssize_t got = recv(client_fd, req + n, sizeof req - 1 - (size_t)n, 0);
+      if (got <= 0) break;
+      n += got;
+      req[n] = '\0';
+      if (strstr(req, "\r\n\r\n")) break;
+    }
     if (n <= 0) {
       close(client_fd);
       continue;
@@ -1358,11 +1457,13 @@ main() {
     line_end = strstr(req, "\r\n");
     if (line_end != NULL) {
       *line_end = '\0';
+      headers = line_end + 2;
     }
 
     path[0] = '\0';
-    if (strncmp(req, "GET ", 4) == 0) {
-      const char *p = req + 4;
+    if (strncmp(req, "GET ", 4) == 0 || strncmp(req, "HEAD ", 5) == 0) {
+      const char *p = req + (req[0] == 'H' ? 5 : 4);
+      head_only = req[0] == 'H';
       size_t i = 0;
       while (*p != '\0' && *p != ' ' && *p != '?' && i + 1 < sizeof path) {
         path[i++] = *p++;
@@ -1374,7 +1475,9 @@ main() {
     offset = parse_query_long(req, "offset", 0);
     rom_id = parse_query_long(req, "id", -1);
 
-    if (strcmp(path, "/rom") == 0 && rom_id >= 0) {
+    if (strcmp(path, "/pkg") == 0) {
+      serve_installer_pkg(client_fd, headers, head_only);
+    } else if (strcmp(path, "/rom") == 0 && rom_id >= 0) {
       serve_rom_details(client_fd, &cfg, auth_b64, rom_id, platform_id,
                          (int)offset);
     } else if (strcmp(path, "/status") == 0) {
