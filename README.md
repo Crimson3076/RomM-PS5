@@ -34,6 +34,19 @@ Users are responsible for supplying their own legally obtained game backups and 
 
 Never commit RomM passwords or Client API Tokens to this repository. Credentials must be entered locally and excluded from logs, screenshots, examples, and test fixtures.
 
+## Building the App
+
+`app/romm_client` is a first milestone: it connects to a RomM server over plain HTTP (not HTTPS -- TLS is not yet implemented), authenticates with a username/password over HTTP Basic auth, fetches `GET /api/roms`, and shows the total game count as a PS5 notification.
+
+Build it with the [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk):
+
+```
+export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+make -C app/romm_client
+```
+
+Before running it, copy `app/romm_client/config.example.txt` to `app/romm_client/config.txt` and fill in your RomM server's LAN host/port and credentials, then place it on the PS5 at `/data/romm-ps5/config.txt`. `config.txt` is gitignored so credentials are never committed.
+
 ## Development Deployment
 
 Once a build produces a compiled ELF payload, `tools/deploy_payload.py` sends it to a jailbroken PS5 running [etaHEN](https://github.com/etaHEN)'s `elfldr` listener (default port 9021) over a plain TCP connection, then prints any stdout/stderr the payload streams back:
