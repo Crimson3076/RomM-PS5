@@ -32,6 +32,9 @@ along with this program; see the file COPYING. If not, see
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#ifdef __FreeBSD__
+#include <sys/sysctl.h>
+#endif
 
 #define CONFIG_PATH "/data/romm-ps5/config.txt"
 #define UI_PORT "8081"
@@ -77,6 +80,91 @@ _Static_assert(sizeof(playgo_info_t) == 9984, "PlayGo ABI size");
 int sceAppInstUtilInitialize(void);
 int sceAppInstUtilInstallByPackage(const pkg_metadata_t*, pkg_info_t*,
                                     playgo_info_t*);
+
+#define SHELLCORE_AUTHID 0x3800000000000010ULL
+#define SYSTEM_INSTALL_AUTHID 0x4801000000000013ULL
+
+#ifdef __FreeBSD__
+extern uint64_t kernel_get_ucred_authid(pid_t);
+extern int kernel_set_ucred_authid(pid_t, uint64_t);
+#endif
+
+static int
+parse_firmware_major(const char *version) {
+  const char *p;
+  int major = 0;
+  if (!version) return 0;
+  p = strstr(version, "releases/");
+  if (!p) return 0;
+  p += strlen("releases/");
+  if (*p < '0' || *p > '9') return 0;
+  while (*p >= '0' && *p <= '9') {
+    major = major * 10 + (*p - '0');
+    p++;
+  }
+  return major;
+}
+
+static int
+detect_firmware_major(void) {
+#ifdef __FreeBSD__
+  char version[256];
+  size_t size = sizeof version;
+  if (sysctlbyname("kern.version", version, &size, NULL, 0)) return 0;
+  version[sizeof version - 1] = '\0';
+  return parse_firmware_major(version);
+#else
+  return 0;
+#endif
+}
+
+/* Sony's installer establishes credential-sensitive IPC state during
+   Initialize. Keep both Initialize and InstallByPackage inside one authid
+   window. FW 10+ requires SYSTEM; older supported firmware uses ShellCore. */
+static int
+installer_auth_acquire(uint64_t *saved_authid, uint64_t *target_authid,
+                       int *firmware_major) {
+  *firmware_major = detect_firmware_major();
+  *target_authid = *firmware_major >= 10 ?
+    SYSTEM_INSTALL_AUTHID : SHELLCORE_AUTHID;
+#ifdef __FreeBSD__
+  *saved_authid = kernel_get_ucred_authid(getpid());
+  if (!*saved_authid) {
+    printf("[install] cannot read current authid; is kstuff-lite loaded?\n");
+    return -1;
+  }
+  if (kernel_set_ucred_authid(getpid(), *target_authid) ||
+      kernel_get_ucred_authid(getpid()) != *target_authid) {
+    printf("[install] authid swap failed: current=0x%llx target=0x%llx\n",
+           (unsigned long long)*saved_authid,
+           (unsigned long long)*target_authid);
+    return -1;
+  }
+#else
+  *saved_authid = 0;
+#endif
+  printf("[install] firmware_major=%d authid_before=0x%llx authid_target=0x%llx (%s)\n",
+         *firmware_major, (unsigned long long)*saved_authid,
+         (unsigned long long)*target_authid,
+         *target_authid == SYSTEM_INSTALL_AUTHID ? "SYSTEM" : "ShellCore");
+  return 0;
+}
+
+static void
+installer_auth_release(uint64_t saved_authid) {
+#ifdef __FreeBSD__
+  int attempt;
+  if (!saved_authid) return;
+  for (attempt = 0; attempt < 3; attempt++) {
+    (void)kernel_set_ucred_authid(getpid(), saved_authid);
+    if (kernel_get_ucred_authid(getpid()) == saved_authid) return;
+  }
+  printf("[install] WARNING: could not restore authid=0x%llx\n",
+         (unsigned long long)saved_authid);
+#else
+  (void)saved_authid;
+#endif
+}
 
 typedef struct {
   char host[128];
@@ -1020,7 +1108,8 @@ run_transfer(void *unused) {
   pkg_info_t pkginfo = {0};
   playgo_info_t playgoinfo = {0};
   static int installer_initialized = 0; /* one worker at a time */
-  int err;
+  int err, firmware_major;
+  uint64_t saved_authid, target_authid;
   (void)unused;
   pthread_mutex_lock(&transfer_lock);
   job = transfer_job;
@@ -1066,22 +1155,33 @@ run_transfer(void *unused) {
   metainfo.uri = dest_path;
   metainfo.ex_uri = "";
   metainfo.playgo_scenario_id = "";
-  metainfo.content_id = content_id;
+  /* content_id in metadata is input-only for remote URL flows. For a
+     staged local PKG, Sony reads it from the header and returns it in
+     pkginfo. Seeding this field can cause a parser rejection. */
+  metainfo.content_id = "";
   metainfo.content_name = fs_name;
   metainfo.icon_url = "";
   transfer_message("Requesting installation...");
-  printf("[install] PlayGo buffer=%zu bytes, uri=%s content_id=%s\n",
+  printf("[install] PlayGo buffer=%zu bytes, uri=%s header_content_id=%s\n",
          sizeof playgoinfo, dest_path, content_id);
+  if (installer_auth_acquire(&saved_authid, &target_authid,
+                             &firmware_major)) {
+    snprintf(result, sizeof result,
+             "Installer privilege setup failed. Confirm kstuff-lite is loaded, then reboot before retrying.");
+    goto done;
+  }
   if (!installer_initialized) {
     err = sceAppInstUtilInitialize();
     printf("[install] sceAppInstUtilInitialize -> 0x%x\n", err);
     if (err) {
+      installer_auth_release(saved_authid);
       snprintf(result, sizeof result, "Installer initialization failed (0x%x). PKG retained.", err);
       goto done;
     }
     installer_initialized = 1;
   }
   err = sceAppInstUtilInstallByPackage(&metainfo, &pkginfo, &playgoinfo);
+  installer_auth_release(saved_authid);
   printf("[install] sceAppInstUtilInstallByPackage -> 0x%x\n", err);
   printf("[install] returned content_id=%.48s type=%d platform=%d\n",
          pkginfo.content_id, pkginfo.type, pkginfo.platform);
