@@ -1366,7 +1366,10 @@ serve_download(int client_fd, const config_t *cfg, const char *auth_b64,
   snprintf(transfer_job.message, sizeof transfer_job.message, "Preparing transfer...");
   err = pthread_attr_init(&attr);
   if (!err) {
-    err = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    /* The downloader alone has ~85 KiB of automatic buffers. Do not rely
+       on the console libc's default worker stack being large enough. */
+    err = pthread_attr_setstacksize(&attr, 512 * 1024);
+    if (!err) err = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     if (!err) err = pthread_create(&worker, &attr, run_transfer, NULL);
     pthread_attr_destroy(&attr);
   }

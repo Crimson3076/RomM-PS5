@@ -39,11 +39,13 @@ def send_payload(host: str, port: int, payload_path: Path, timeout: float) -> No
             while True:
                 chunk = sock.recv(CHUNK_SIZE)
                 if not chunk:
+                    print("\n[deploy] Console closed the payload logging connection.", file=sys.stderr)
                     break
                 sys.stdout.buffer.write(chunk)
                 sys.stdout.flush()
-        except (ConnectionResetError, OSError):
-            pass
+        except OSError as exc:
+            print(f"\n[deploy] Payload logging connection lost: {exc}", file=sys.stderr)
+            raise
 
 
 def main() -> None:
