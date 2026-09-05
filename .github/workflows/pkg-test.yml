@@ -1,0 +1,39 @@
+name: Build PS4 download test payload
+on:
+  push:
+    branches: [codex/fix-ps4-pkg-downloads]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compiler
+        run: sudo apt-get update && sudo apt-get install -y clang-18 lld-18
+      - name: Install pinned SDK
+        run: |
+          curl -fL https://github.com/ps5-payload-dev/sdk/releases/download/v0.43/ps5-payload-sdk.zip -o /tmp/sdk.zip
+          echo "a9cc9929f21b2b2c5d5b309f3bab4997067c45281c0622cf4838b1aecba66fcb  /tmp/sdk.zip" | sha256sum -c -
+          unzip -q /tmp/sdk.zip -d /opt
+      - name: Host regression tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Build console payload
+        env:
+          PS5_PAYLOAD_SDK: /opt/ps5-payload-sdk
+        run: |
+          make -C app/romm_ui
+          file app/romm_ui/romm_ui.elf
+          mkdir -p test-revision
+          cp app/romm_ui/romm_ui.elf test-revision/romm_ui-${GITHUB_SHA:0:7}.elf
+          cp tools/deploy_payload.py test-revision/
+          git rev-parse HEAD > test-revision/REVISION.txt
+          cd test-revision
+          sha256sum *.elf > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: romm-ps5-pkg-test-${{ github.sha }}
+          path: test-revision/
+          if-no-files-found: error
+          retention-days: 30
