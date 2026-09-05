@@ -28,11 +28,11 @@ ELF := romm_ui.elf
 CFLAGS := -Wall -Werror -g
 CFLAGS += -lpthread
 CFLAGS += -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ZLIB_APIS -DMINIZ_NO_TIME
-MINIZ_SRC := vendor/miniz/miniz.c vendor/miniz/miniz_tinfl.c vendor/miniz/miniz_zip.c
+MINIZ_SRC := vendor/miniz/miniz.c vendor/miniz/miniz_tinfl.c miniz_reader.c
 
 all: $(ELF)
 
-$(ELF): main.c pkg_diagnostics.h etahen_client.h ps5_files.h $(MINIZ_SRC) $(wildcard vendor/miniz/*.h)
+$(ELF): main.c pkg_diagnostics.h etahen_client.h ps5_files.h $(MINIZ_SRC) $(wildcard vendor/miniz/*.h) vendor/miniz/miniz_zip.c
 	$(CC) $(CFLAGS) -o $@ main.c $(MINIZ_SRC)
 
 clean:
