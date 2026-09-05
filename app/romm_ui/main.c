@@ -253,23 +253,13 @@ romm_get(const config_t *cfg, const char *auth_b64, const char *path,
 }
 
 
-/* Find the next occurrence of "key":"..." starting at *cursor, copy the
-   unescaped value into out, and advance *cursor past it. Returns 0 on
-   success, -1 if not found. */
-static int
-extract_field(const char **cursor, const char *key,
-              char *out, size_t out_size) {
-  const char *p;
-  const char *v;
-  size_t oi;
+/* Copy a JSON string value starting right after its opening quote,
+   unescaping \" and \\, until the closing quote or end of string. */
+static void
+copy_json_string(const char *value_start, char *out, size_t out_size) {
+  const char *v = value_start;
+  size_t oi = 0;
 
-  p = strstr(*cursor, key);
-  if (p == NULL) {
-    return -1;
-  }
-  v = p + strlen(key);
-
-  oi = 0;
   while (*v != '\0' && *v != '"') {
     if (*v == '\\' && *(v + 1) != '\0') {
       v++;
@@ -280,9 +270,6 @@ extract_field(const char **cursor, const char *key,
     v++;
   }
   out[oi < out_size ? oi : out_size - 1] = '\0';
-
-  *cursor = (*v == '"') ? v + 1 : v;
-  return 0;
 }
 
 
@@ -387,6 +374,21 @@ find_int_field_in_range(const char *start, const char *end, const char *key) {
     return -1;
   }
   return strtol(p + strlen(key), NULL, 10);
+}
+
+
+/* Find "key":"..." within [start,end) and copy its unescaped value into
+   out. Writes an empty string and returns -1 if not found. */
+static int
+find_string_field_in_range(const char *start, const char *end,
+                            const char *key, char *out, size_t out_size) {
+  const char *p = find_in_range(start, end, key);
+  if (p == NULL) {
+    out[0] = '\0';
+    return -1;
+  }
+  copy_json_string(p + strlen(key), out, out_size);
+  return 0;
 }
 
 
@@ -504,6 +506,7 @@ serve_page(int client_fd, const config_t *cfg, const char *auth_b64,
   char platform[128];
   char fs_name_esc[512];
   char platform_esc[256];
+  long rom_id;
   char *html;
   size_t html_cap = 65536;
   size_t html_len = 0;
@@ -541,19 +544,38 @@ serve_page(int client_fd, const config_t *cfg, const char *auth_b64,
   } else {
     cursor = body;
     shown = 0;
-    while (shown < ROMS_PER_PAGE &&
-           extract_field(&cursor, "\"fs_name\":\"",
-                         fs_name, sizeof fs_name) == 0) {
-      const char *plat_cursor = cursor;
-      if (extract_field(&plat_cursor, "\"platform_display_name\":\"",
-                        platform, sizeof platform) != 0) {
-        platform[0] = '\0';
+    for (;;) {
+      const char *fs_match;
+      const char *obj_start;
+      const char *obj_end;
+
+      if (shown >= ROMS_PER_PAGE) {
+        break;
       }
+      fs_match = strstr(cursor, "\"fs_name\":\"");
+      if (fs_match == NULL) {
+        break;
+      }
+      obj_start = find_object_start(body, fs_match);
+      obj_end = obj_start != NULL ? find_object_end(obj_start) : NULL;
+      if (obj_start == NULL || obj_end == NULL) {
+        break;
+      }
+
+      copy_json_string(fs_match + strlen("\"fs_name\":\""),
+                        fs_name, sizeof fs_name);
+      find_string_field_in_range(obj_start, obj_end,
+                                  "\"platform_display_name\":\"",
+                                  platform, sizeof platform);
+      rom_id = find_int_field_in_range(obj_start, obj_end, "\"id\":");
+
       html_escape(fs_name, fs_name_esc, sizeof fs_name_esc);
       html_escape(platform, platform_esc, sizeof platform_esc);
-      APPEND("<li><a href=\"#\" tabindex=\"0\">%s <small>(%s)</small></a></li>",
-             fs_name_esc, platform_esc);
+      APPEND("<li><a href=\"/rom?id=%ld&platform_id=%ld&offset=%d\" "
+             "tabindex=\"0\">%s <small>(%s)</small></a></li>",
+             rom_id, platform_id, offset, fs_name_esc, platform_esc);
       shown++;
+      cursor = obj_end + 1;
       if (html_cap - html_len < 1024) {
         break;
       }
@@ -606,6 +628,142 @@ serve_page(int client_fd, const config_t *cfg, const char *auth_b64,
 }
 
 
+static void
+send_html_page(int client_fd, const char *html, size_t html_len) {
+  char header[256];
+  int header_len = snprintf(header, sizeof header,
+                             "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: text/html; charset=utf-8\r\n"
+                             "Content-Length: %zu\r\n"
+                             "Connection: close\r\n"
+                             "\r\n", html_len);
+  send_all(client_fd, header, (size_t)header_len);
+  send_all(client_fd, html, html_len);
+}
+
+
+static void
+format_size(long bytes, char *out, size_t out_size) {
+  static const char *units[] = {"B", "KB", "MB", "GB", "TB"};
+  double val;
+  int u = 0;
+
+  if (bytes < 0) {
+    snprintf(out, out_size, "unknown");
+    return;
+  }
+  val = (double)bytes;
+  while (val >= 1024.0 && u < 4) {
+    val /= 1024.0;
+    u++;
+  }
+  snprintf(out, out_size, "%.1f %s", val, units[u]);
+}
+
+
+static void
+serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
+                   long rom_id, long platform_id, int offset) {
+  char api_path[64];
+  char *alloc = NULL;
+  char *body;
+  char fs_name[256];
+  char platform[128];
+  char fs_name_esc[512];
+  char platform_esc[256];
+  char size_str[32];
+  long size_bytes;
+  char html[4096];
+  size_t html_len;
+  const char *p;
+
+  snprintf(api_path, sizeof api_path, "/api/roms/%ld", rom_id);
+  body = romm_get(cfg, auth_b64, api_path, &alloc);
+
+  if (body == NULL) {
+    html_len = snprintf(html, sizeof html,
+      "<!doctype html><html><head><meta charset=\"utf-8\">"
+      "<title>RomM</title>"
+      "<style>body{background:#111;color:#eee;font-family:sans-serif;"
+      "font-size:2.2vw}a{color:#8cf}</style></head><body>"
+      "<h1>Could not reach RomM server.</h1>"
+      "<p><a href=\"/?platform_id=%ld&offset=%d\" tabindex=\"0\">"
+      "&laquo; Back</a></p></body></html>", platform_id, offset);
+    send_html_page(client_fd, html, html_len);
+    close(client_fd);
+    return;
+  }
+
+  p = strstr(body, "\"fs_name\":\"");
+  if (p != NULL) {
+    copy_json_string(p + strlen("\"fs_name\":\""), fs_name, sizeof fs_name);
+  } else {
+    strncpy(fs_name, "Unknown", sizeof fs_name - 1);
+    fs_name[sizeof fs_name - 1] = '\0';
+  }
+
+  p = strstr(body, "\"platform_display_name\":\"");
+  if (p != NULL) {
+    copy_json_string(p + strlen("\"platform_display_name\":\""),
+                      platform, sizeof platform);
+  } else {
+    platform[0] = '\0';
+  }
+
+  p = strstr(body, "\"fs_size_bytes\":");
+  size_bytes = (p != NULL) ?
+    strtol(p + strlen("\"fs_size_bytes\":"), NULL, 10) : -1;
+
+  free(alloc);
+
+  html_escape(fs_name, fs_name_esc, sizeof fs_name_esc);
+  html_escape(platform, platform_esc, sizeof platform_esc);
+  format_size(size_bytes, size_str, sizeof size_str);
+
+  html_len = snprintf(html, sizeof html,
+    "<!doctype html><html><head><meta charset=\"utf-8\">"
+    "<title>RomM</title>"
+    "<style>"
+    "body{background:#111;color:#eee;font-family:sans-serif;font-size:2.2vw}"
+    "a{color:#8cf;display:block;padding:1.5vw;text-decoration:none}"
+    "a:focus,a:hover{background:#8cf;color:#111}"
+    "</style></head><body>"
+    "<h1>%s</h1>"
+    "<p>Platform: %s</p>"
+    "<p>Size: %s</p>"
+    "<a href=\"/download?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Download</a>"
+    "<a href=\"/?platform_id=%ld&offset=%d\" tabindex=\"0\">&laquo; Back to list</a>"
+    "</body></html>",
+    fs_name_esc, platform_esc, size_str,
+    rom_id, platform_id, offset,
+    platform_id, offset);
+
+  send_html_page(client_fd, html, html_len);
+  close(client_fd);
+}
+
+
+static void
+serve_download_placeholder(int client_fd, long rom_id, long platform_id,
+                            int offset) {
+  char html[1024];
+  size_t html_len = snprintf(html, sizeof html,
+    "<!doctype html><html><head><meta charset=\"utf-8\">"
+    "<title>RomM</title>"
+    "<style>body{background:#111;color:#eee;font-family:sans-serif;"
+    "font-size:2.2vw}"
+    "a{color:#8cf;display:block;padding:1.5vw;text-decoration:none}"
+    "a:focus,a:hover{background:#8cf;color:#111}</style></head><body>"
+    "<h1>Download not implemented yet</h1>"
+    "<p>Rom #%ld is queued for a future milestone -- the actual download "
+    "pipeline hasn't been built yet.</p>"
+    "<a href=\"/rom?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">"
+    "&laquo; Back</a></body></html>", rom_id, rom_id, platform_id, offset);
+  send_html_page(client_fd, html, html_len);
+  close(client_fd);
+}
+
+
 int
 main() {
   config_t cfg;
@@ -649,8 +807,10 @@ main() {
     char req[REQ_BUF_SIZE];
     ssize_t n;
     char *line_end;
+    char path[32];
     long platform_id;
     long offset;
+    long rom_id;
 
     if (client_fd < 0) {
       continue;
@@ -667,10 +827,27 @@ main() {
     if (line_end != NULL) {
       *line_end = '\0';
     }
+
+    path[0] = '\0';
+    if (strncmp(req, "GET ", 4) == 0) {
+      const char *p = req + 4;
+      size_t i = 0;
+      while (*p != '\0' && *p != ' ' && *p != '?' && i + 1 < sizeof path) {
+        path[i++] = *p++;
+      }
+      path[i] = '\0';
+    }
+
     platform_id = parse_query_long(req, "platform_id", -1);
     offset = parse_query_long(req, "offset", 0);
+    rom_id = parse_query_long(req, "id", -1);
 
-    if (platform_id < 0) {
+    if (strcmp(path, "/rom") == 0 && rom_id >= 0) {
+      serve_rom_details(client_fd, &cfg, auth_b64, rom_id, platform_id,
+                         (int)offset);
+    } else if (strcmp(path, "/download") == 0 && rom_id >= 0) {
+      serve_download_placeholder(client_fd, rom_id, platform_id, (int)offset);
+    } else if (platform_id < 0) {
       serve_picker(client_fd, &cfg, auth_b64);
     } else {
       serve_page(client_fd, &cfg, auth_b64, platform_id, (int)offset);
