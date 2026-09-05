@@ -986,13 +986,19 @@ serve_download(int client_fd, const config_t *cfg, const char *auth_b64,
     snprintf(dest_path, sizeof dest_path, "%s/%s", DOWNLOAD_DIR, fs_name);
 
     notify("RomM: downloading %s ...", fs_name);
+    printf("[download] GET %s -> %s\n", content_path, dest_path);
+    fflush(stdout);
     rc = romm_download_to_file(cfg, auth_b64, content_path, dest_path);
     if (rc != 0) {
       notify("RomM: download failed for %s", fs_name);
+      printf("[download] FAILED for %s\n", dest_path);
+      fflush(stdout);
       serve_error_page(client_fd, "Download failed.",
                         rom_id, platform_id, offset);
       return;
     }
+    printf("[download] complete: %s\n", dest_path);
+    fflush(stdout);
 
     notify("RomM: download complete, installing %s ...", fs_name);
 
@@ -1019,12 +1025,20 @@ serve_download(int client_fd, const config_t *cfg, const char *auth_b64,
         }
       }
 
+      printf("[install] uri=%s content_name=%s\n",
+             metainfo.uri, metainfo.content_name);
+      fflush(stdout);
+
       err = sceAppInstUtilInitialize();
+      printf("[install] sceAppInstUtilInitialize -> 0x%x\n", err);
+      fflush(stdout);
       if (err != 0) {
         notify("RomM: sceAppInstUtilInitialize failed: 0x%x", err);
       } else {
         err = sceAppInstUtilInstallByPackage(&metainfo, &pkginfo,
                                               &playgoinfo);
+        printf("[install] sceAppInstUtilInstallByPackage -> 0x%x\n", err);
+        fflush(stdout);
         if (err == 0) {
           notify("RomM: install started for %s", fs_name);
         } else {
@@ -1060,6 +1074,8 @@ main() {
   int listen_fd;
   struct sockaddr_in addr;
   int optval = 1;
+
+  setvbuf(stdout, NULL, _IONBF, 0);
 
   if (load_config(&cfg) != 0 || cfg.host[0] == '\0') {
     return 1;
