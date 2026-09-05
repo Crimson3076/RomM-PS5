@@ -1,6 +1,8 @@
 /* etaHEN DPI v2: form POST /upload, port 12800, text SUCCESS:/FAILED:.
  * Source: etaHEN/etaHEN, Source Code/util/source/DirectPKGInstaller.cpp.
- * Pass the existing local path as url, not the package bytes. No retries:
+ * Submit etaHEN's HTTP file-serving URL, not a bare path or package bytes.
+ * PlayGo rejects bare paths as INVALID_URI_SCHEMA on the tested console.
+ * No retries:
  * a lost response can mean that etaHEN already submitted the installation.
  */
 #ifndef ETAHEN_DPI_PORT
@@ -12,8 +14,8 @@
 
 static int
 etahen_install(const char *path, const char *name, char *result, size_t result_size) {
-  char encoded_path[1804], encoded_name[772], form[2700];
-  char request[3200], response[8192];
+  char encoded_path[1804], uri[1840], encoded_uri[5524], encoded_name[772], form[6400];
+  char request[6800], response[8192];
   size_t sent = 0, used = 0;
   int sock = -1, rc = -1, status = 0, len;
   struct sockaddr_in addr = {0};
@@ -21,13 +23,27 @@ etahen_install(const char *path, const char *name, char *result, size_t result_s
   ssize_t n;
   snprintf(result, result_size,
     "etaHEN DPI v2 unavailable. Enable it in etaHEN (port 12800). PKG saved.");
-  if (strlen(path) > 599 || strlen(name) > 255) {
+  if (path[0] != '/' || strlen(path) > 599 || strlen(name) > 255) {
     snprintf(result, result_size, "PKG path too long for etaHEN request. PKG saved.");
     return -1;
   }
   url_encode(path, encoded_path, sizeof encoded_path);
+  /* Keep directory separators, escape filename punctuation and spaces. A
+     literal percent in a filename stays escaped, including a literal %2F. */
+  size_t read_pos = 0, write_pos = 0;
+  while (encoded_path[read_pos]) {
+    if (!strncmp(encoded_path + read_pos, "%2F", 3)) {
+      encoded_path[write_pos++] = '/';
+      read_pos += 3;
+    } else encoded_path[write_pos++] = encoded_path[read_pos++];
+  }
+  encoded_path[write_pos] = '\0';
+  len = snprintf(uri, sizeof uri, "http://127.0.0.1:%d%s", ETAHEN_DPI_PORT, encoded_path);
+  if (len < 0 || (size_t)len >= sizeof uri) return -1;
+  /* The HTTP URI itself is a form value, so encode it a second time. */
+  url_encode(uri, encoded_uri, sizeof encoded_uri);
   url_encode(name, encoded_name, sizeof encoded_name);
-  len = snprintf(form, sizeof form, "url=%s&content_name=%s", encoded_path, encoded_name);
+  len = snprintf(form, sizeof form, "url=%s&content_name=%s", encoded_uri, encoded_name);
   if (len < 0 || (size_t)len >= sizeof form) return -1;
   len = snprintf(request, sizeof request,
     "POST /upload HTTP/1.0\r\nHost: 127.0.0.1:%d\r\n"
@@ -44,6 +60,7 @@ etahen_install(const char *path, const char *name, char *result, size_t result_s
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   if (connect(sock, (struct sockaddr *)&addr, sizeof addr)) goto done;
   printf("[etahen] POST /upload on 127.0.0.1:%d saved_path=%s\n", ETAHEN_DPI_PORT, path);
+  printf("[etahen] source_uri=%s\n", uri);
   /* From here on, an interrupted request must not be reported as rejected. */
   rc = -2;
   snprintf(result, result_size,

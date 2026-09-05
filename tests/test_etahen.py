@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -85,7 +85,7 @@ int main(int argc, char **argv) {
                 errors.append(exc)
         thread = threading.Thread(target=serve)
         thread.start()
-        path = '/data/romm-ps5/downloads/[test] A+B & C.pkg'
+        path = '/data/romm-ps5/downloads/[test] A+B & C %2F #?.pkg'
         result = subprocess.run([str(self.exe), str(port), path, 'A+B & C.pkg'],
                                 capture_output=True, text=True, timeout=4)
         thread.join(4)
@@ -96,7 +96,9 @@ int main(int argc, char **argv) {
         head, form = requests[0]
         self.assertTrue(head.startswith(b'POST /upload HTTP/1.0\r\n'))
         self.assertNotIn(b'Authorization:', head)
-        self.assertEqual(parse_qs(form.decode()), {'url': [path], 'content_name': ['A+B & C.pkg']})
+        self.assertEqual(parse_qs(form.decode()), {
+            'url': [f'http://127.0.0.1:{port}' + quote(path, safe='/')],
+            'content_name': ['A+B & C.pkg']})
         return result.stdout
 
     def test_acceptance_and_form_encoding(self):

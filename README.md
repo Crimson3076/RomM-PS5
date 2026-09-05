@@ -107,10 +107,14 @@ against a real RomM server and PS5.
 ### etaHEN installation
 
 Enable **DPI v2** in etaHEN before requesting installation. RomM sends an
-HTTP form POST to `127.0.0.1:12800/upload`, with the saved console path in `url`
+HTTP form POST to `127.0.0.1:12800/upload`, with etaHEN's HTTP file-serving URL
+(`http://127.0.0.1:12800/data/romm-ps5/downloads/<encoded-filename>`) in `url`
 and the filename in `content_name`. This matches
 [etaHEN's DPI implementation](https://github.com/etaHEN/etaHEN/blob/main/Source%20Code/util/source/DirectPKGInstaller.cpp).
-No RomM credentials or PKG bytes are sent to that endpoint. RomM no longer
+The URI path is percent-encoded and then form-encoded; a bare filesystem path
+was rejected with `SCE_PLAYGO_ERROR_CORE_INVALID_URI_SCHEMA` on console.
+etaHEN serves the existing PKG locally; no new RomM download is needed.
+No RomM credentials or PKG bytes are sent in the POST. RomM no longer
 calls Sony's installer directly, changes installer credentials, or serves `/pkg`.
 
 **Download only** saves and checks the file without contacting etaHEN.
