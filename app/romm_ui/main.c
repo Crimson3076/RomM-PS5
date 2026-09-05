@@ -114,7 +114,7 @@ detect_firmware_major(void) {
   version[sizeof version - 1] = '\0';
   return parse_firmware_major(version);
 #else
-  return 0;
+  return parse_firmware_major(NULL);
 #endif
 }
 
