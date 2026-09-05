@@ -96,7 +96,12 @@ int main(int argc, char **argv) {
 
     def test_root_stored_zip64(self):
         self.prepare(self.archive(compression=zipfile.ZIP_STORED, zip64=True))
-        self.assertTrue((self.root / 'games/romm-7/sce_sys/param.json').exists())
+        game = self.root / 'games/romm-7'
+        self.assertTrue((game / 'sce_sys/param.json').exists())
+        # Archive-root games (no wrapper folder) publish the mkdtemp() staging
+        # directory itself; it must not keep mkdtemp's private 0700 mode or
+        # the mounter can discover the tile but never read into it to launch.
+        self.assertEqual(stat.S_IMODE(game.stat().st_mode), 0o755)
 
     def test_large_zip64_game_entry_count(self):
         # Match the reported ASTRO BOT entry count with small synthetic files.

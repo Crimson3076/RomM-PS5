@@ -267,6 +267,10 @@ ps5_prepare(const char *source, const char *name, long rom_id, char *result, siz
          count, (unsigned long long)expanded, final);
   snprintf(stage, sizeof stage, "%s/romm-%ld-XXXXXX", PS5_STAGE_DIR, rom_id);
   if (!mkdtemp(stage)) { stage[0] = 0; goto done; }
+  /* mkdtemp() creates the directory 0700. When the game root is the archive
+     root itself (no wrapper folder), this directory is renamed straight into
+     PS5_GAME_DIR, so fix its mode or ShadowMountPlus cannot read into it. */
+  if (chmod(stage, 0755)) goto done;
   transfer_message("Extracting PS5 archive...");
   ps5_extract_sink sink = {.expected = expanded, .last_log = time(NULL), .entries_total = count};
   /* The staging directory is private and ZIP symlinks are rejected. Reuse
