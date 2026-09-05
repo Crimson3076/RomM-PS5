@@ -47,6 +47,18 @@ make -C app/romm_client
 
 Before running it, copy `app/romm_client/config.example.txt` to `app/romm_client/config.txt` and fill in your RomM server's LAN host/port and credentials, then place it on the PS5 at `/data/romm-ps5/config.txt`. `config.txt` is gitignored so credentials are never committed.
 
+## On-Screen UI
+
+`app/romm_ui` is the first on-screen browsing milestone. It reads the same `/data/romm-ps5/config.txt`, runs a tiny local HTTP server on the console at `127.0.0.1:8081`, and launches the PS5's system web browser (via `sceSystemServiceLaunchWebBrowser`, using only public SDK stub libraries) pointed at it. Each page renders a plain HTML list of ROM filenames and platforms fetched from `GET /api/roms`, with Prev/Next links for pagination. DualSense navigation (D-pad/X/Circle) comes from the system browser's own built-in controller-to-page input mapping -- no JavaScript gamepad API is used.
+
+Build and deploy it the same way as `romm_client`:
+
+```
+make -C app/romm_ui
+export PS5_HOST=<PS5_IP> PS5_PORT=9021
+make -C app/romm_ui test
+```
+
 ## Development Deployment
 
 Once a build produces a compiled ELF payload, `tools/deploy_payload.py` sends it to a jailbroken PS5 running [etaHEN](https://github.com/etaHEN)'s `elfldr` listener (default port 9021) over a plain TCP connection, then prints any stdout/stderr the payload streams back:
