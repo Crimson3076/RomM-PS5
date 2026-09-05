@@ -76,3 +76,30 @@ The project is currently establishing its architecture and build system. Develop
 ## License
 
 This project is licensed under the GNU General Public License v3.0. Third-party components remain subject to their respective licenses.
+
+## Download diagnostics and regression tests
+
+PS4 downloads require a single `.pkg` entry and a plain HTTP endpoint returning
+HTTP 200 with a nonzero `Content-Length`. The downloader requests HTTP/1.0 and
+identity encoding. Redirects, chunked responses, and compressed responses fail
+explicitly; HTTPS and redirect handling are not implemented.
+
+Transfers are written to `.part` files, checked against the declared byte count,
+and renamed only after successful writes and close. This checks transfer
+completeness, not package authenticity or install compatibility. A failed
+transfer preserves an existing completed file. Socket reads/writes time out
+after 60 seconds of inactivity. The UI remains synchronous during downloads.
+
+Capture payload stdout with `tools/deploy_payload.py`. Failure lines include
+HTTP status and received/expected bytes, without authentication headers. A
+successful download followed by an installation error retains the PKG and shows
+the installer error code in the browser.
+
+Run host-side downloader regression tests (requires a C compiler and Python):
+
+```
+python3 -m unittest discover -s tests -v
+```
+
+Console validation still requires building with the PS5 payload SDK and testing
+against a real RomM server and PS5.

@@ -16,6 +16,10 @@ along with this program; see the file COPYING. If not, see
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <stdint.h>
+#include <strings.h>
+#include <sys/time.h>
 #include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
@@ -304,92 +308,126 @@ url_encode(const char *in, char *out, size_t out_size) {
 }
 
 
-/* Stream a GET response body directly to a local file, without buffering
-   the whole thing in memory -- needed for multi-gigabyte ROM downloads.
-   Returns 0 on success (HTTP 200 and clean connection close), -1 on any
-   failure (removing any partial file written). */
+/* Require a framed, complete response before exposing a file to the installer.
+   HTTP/1.0 requests avoid chunked transfer encoding; reject it if sent anyway. */
 static int
 romm_download_to_file(const config_t *cfg, const char *auth_b64,
                        const char *path, const char *dest_path) {
-  char request[512];
-  int sock;
-  FILE *fp;
-  char buf[65536];
+  char request[2048], header[16384], buf[65536], part[1024];
+  size_t used = 0;
+  unsigned long long expected = 0, received = 0;
+  int have_length = 0, status = 0, ok = 0, sock = -1, part_created = 0;
+  FILE *fp = NULL;
+  const char *failure = "connection failed";
+  struct timeval timeout = {60, 0};
+  int len;
   ssize_t n;
-  int header_done = 0;
-  int ok = 0;
-  char header_buf[4096];
-  size_t header_len = 0;
 
+  len = snprintf(part, sizeof part, "%s.part", dest_path);
+  if (len < 0 || (size_t)len >= sizeof part) return -1;
+  len = snprintf(request, sizeof request,
+                 "GET %s HTTP/1.0\r\nHost: %s:%s\r\n"
+                 "Authorization: Basic %s\r\n"
+                 "Accept-Encoding: identity\r\nConnection: close\r\n\r\n",
+                 path, cfg->host, cfg->port, auth_b64);
+  if (len < 0 || (size_t)len >= sizeof request) return -1;
   sock = connect_host(cfg->host, cfg->port);
-  if (sock < 0) {
-    return -1;
+  if (sock < 0) goto done;
+  if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout) ||
+      setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout)) {
+    failure = "could not set network timeout";
+    goto done;
   }
-
-  snprintf(request, sizeof request,
-           "GET %s HTTP/1.1\r\n"
-           "Host: %s\r\n"
-           "Authorization: Basic %s\r\n"
-           "Connection: close\r\n"
-           "\r\n",
-           path, cfg->host, auth_b64);
-
-  if (send(sock, request, strlen(request), 0) < 0) {
-    close(sock);
-    return -1;
+  while (used < (size_t)len) {
+    n = send(sock, request + used, (size_t)len - used, 0);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) { failure = "request send failed"; goto done; }
+    used += (size_t)n;
   }
-
-  fp = fopen(dest_path, "wb");
-  if (fp == NULL) {
-    close(sock);
-    return -1;
+  /* Read only the header here, so no body bytes can be dropped. */
+  used = 0;
+  while (used < sizeof header - 1) {
+    n = recv(sock, header + used, 1, 0);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) { failure = "incomplete HTTP headers"; goto done; }
+    used++;
+    if (used >= 4 && !memcmp(header + used - 4, "\r\n\r\n", 4)) break;
   }
-
-  while ((n = recv(sock, buf, sizeof buf, 0)) > 0) {
-    if (header_done) {
-      fwrite(buf, 1, (size_t)n, fp);
-      continue;
-    }
-
-    {
-      size_t copy_len = (size_t)n;
-      char *marker;
-
-      if (header_len + copy_len >= sizeof header_buf) {
-        copy_len = sizeof header_buf - 1 - header_len;
-      }
-      memcpy(header_buf + header_len, buf, copy_len);
-      header_len += copy_len;
-      header_buf[header_len] = '\0';
-
-      marker = strstr(header_buf, "\r\n\r\n");
-      if (marker != NULL) {
-        size_t header_bytes = (size_t)(marker + 4 - header_buf);
-        size_t leftover = header_len - header_bytes;
-
-        header_done = 1;
-        ok = (strncmp(header_buf, "HTTP/1.1 200", 12) == 0 ||
-              strncmp(header_buf, "HTTP/1.0 200", 12) == 0);
-        if (!ok) {
-          break;
+  header[used] = '\0';
+  if (used < 4 || memcmp(header + used - 4, "\r\n\r\n", 4)) {
+    failure = "HTTP headers too large"; goto done;
+  }
+  if (sscanf(header, "HTTP/%*u.%*u %d", &status) != 1 || status != 200) {
+    failure = "server did not return HTTP 200"; goto done;
+  }
+  {
+    char *line = strstr(header, "\r\n") + 2;
+    while (*line != '\r') {
+      char *end = strstr(line, "\r\n");
+      *end = '\0';
+      if (!strncasecmp(line, "Content-Length:", 15)) {
+        char *value = line + 15, *tail;
+        unsigned long long length;
+        while (*value == ' ' || *value == '\t') value++;
+        errno = 0;
+        length = strtoull(value, &tail, 10);
+        while (*tail == ' ' || *tail == '\t') tail++;
+        if (*value < '0' || *value > '9' || errno || *tail ||
+            (have_length && length != expected)) {
+          failure = "invalid Content-Length"; goto done;
         }
-        if (leftover > 0) {
-          fwrite(marker + 4, 1, leftover, fp);
+        expected = length;
+        have_length = 1;
+      } else if (!strncasecmp(line, "Transfer-Encoding:", 18)) {
+        failure = "unsupported Transfer-Encoding"; goto done;
+      } else if (!strncasecmp(line, "Content-Encoding:", 17)) {
+        char *value = line + 17;
+        while (*value == ' ' || *value == '\t') value++;
+        if (strcasecmp(value, "identity")) {
+          failure = "unsupported Content-Encoding"; goto done;
         }
-      } else if (header_len >= sizeof header_buf - 1) {
-        break;
       }
+      line = end + 2;
     }
   }
-
-  fclose(fp);
-  close(sock);
-
+  if (!have_length || expected == 0) {
+    failure = "missing or empty Content-Length"; goto done;
+  }
+  printf("[download] HTTP %d, expected=%llu bytes\n", status, expected);
+  fflush(stdout);
+  fp = fopen(part, "wb");
+  if (!fp) { failure = "cannot open temporary download file"; goto done; }
+  part_created = 1;
+  while (received < expected) {
+    size_t want = expected - received > sizeof buf ? sizeof buf :
+                  (size_t)(expected - received);
+    n = recv(sock, buf, want, 0);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) { failure = "transfer interrupted or timed out"; goto done; }
+    if (fwrite(buf, 1, (size_t)n, fp) != (size_t)n) {
+      failure = "disk write failed (check free space)"; goto done;
+    }
+    received += (unsigned long long)n;
+  }
+  if (fclose(fp)) {
+    fp = NULL; failure = "disk flush failed"; goto done;
+  }
+  fp = NULL;
+  if (rename(part, dest_path)) {
+    failure = "cannot finalize download"; goto done;
+  }
+  ok = 1;
+done:
+  if (fp) fclose(fp);
+  if (sock >= 0) close(sock);
   if (!ok) {
-    remove(dest_path);
-    return -1;
+    /* Only remove a temporary file created by this attempt. */
+    if (part_created) remove(part);
+    printf("[download] FAILED: %s (HTTP %d, received=%llu, expected=%llu)\n",
+           failure, status, received, expected);
   }
-  return 0;
+  fflush(stdout);
+  return ok ? 0 : -1;
 }
 
 
@@ -969,10 +1007,17 @@ serve_download(int client_fd, const config_t *cfg, const char *auth_b64,
     return;
   }
 
+  if (strchr(fs_name, '/') || strchr(fs_name, '\\') ||
+      strlen(fs_name) < 5 || strcasecmp(fs_name + strlen(fs_name) - 4, ".pkg")) {
+    serve_error_page(client_fd, "Select a single PS4 .pkg file, not a folder or archive.",
+                    rom_id, platform_id, offset);
+    return;
+  }
+
   html_escape(fs_name, fs_name_esc, sizeof fs_name_esc);
 
   {
-    char encoded_name[512];
+    char encoded_name[768];
     char content_path[800];
     char dest_path[600];
     int rc;
@@ -1044,6 +1089,13 @@ serve_download(int client_fd, const config_t *cfg, const char *auth_b64,
         } else {
           notify("RomM: install failed: 0x%x", err);
         }
+      }
+      if (err != 0) {
+        char message[160];
+        snprintf(message, sizeof message,
+                 "PKG downloaded, but installation failed (0x%x). The file is retained.", err);
+        serve_error_page(client_fd, message, rom_id, platform_id, offset);
+        return;
       }
     }
   }
