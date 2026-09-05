@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from build_support import MINIZ_ARGS
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -28,7 +29,7 @@ int main(int argc, char **argv) {
 }
 ''')
         cls.exe = cls.root / 'download'
-        subprocess.run(['cc', '-Wall', '-Werror', '-I', str(ROOT), str(harness), '-o', str(cls.exe)], check=True)
+        subprocess.run(['cc', *MINIZ_ARGS, '-Wall', '-Werror', '-I', str(ROOT), str(harness), '-o', str(cls.exe)], check=True)
 
     @classmethod
     def tearDownClass(cls):

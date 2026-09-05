@@ -67,7 +67,7 @@ typedef struct {
   config_t cfg;
   char auth[256];
   long rom_id, platform_id;
-  int offset, saved_only, active;
+  int offset, saved_only, active, is_ps5;
   unsigned long long received, expected;
   char message[256];
 } transfer_job_t;
@@ -925,6 +925,21 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
   html_escape(platform, platform_esc, sizeof platform_esc);
   format_size(size_bytes, size_str, sizeof size_str);
 
+  int is_ps5 = platform_id >= 0 && lookup_platform_id(cfg, auth_b64, "ps5") == platform_id;
+  char actions[1600];
+  snprintf(actions, sizeof actions,
+    "<a href=\"/download?id=%ld&platform_id=%ld&offset=%d\">%s</a>"
+    "<a href=\"/download-only?id=%ld&platform_id=%ld&offset=%d\">Download only</a>"
+    "<a href=\"/install-saved?id=%ld&platform_id=%ld&offset=%d\">%s</a>",
+    rom_id, platform_id, offset, is_ps5 ? "Download and prepare PS5 game" : "Download and install with etaHEN",
+    rom_id, platform_id, offset,
+    rom_id, platform_id, offset, is_ps5 ? "Prepare saved PS5 file (no download)" : "Install saved PKG with etaHEN");
+  if (!is_ps5) {
+    size_t used = strlen(actions);
+    snprintf(actions + used, sizeof actions - used,
+      "<a href=\"/inspect-saved?id=%ld&platform_id=%ld&offset=%d\">Inspect saved PKG (no install)</a>",
+      rom_id, platform_id, offset);
+  }
   html_len = snprintf(html, sizeof html,
     "<!doctype html><html><head><meta charset=\"utf-8\">"
     "<title>RomM</title>"
@@ -936,17 +951,11 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
     "<h1>%s</h1>"
     "<p>Platform: %s</p>"
     "<p>Size: %s</p>"
-    "<a href=\"/download?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Download and install with etaHEN</a>"
-    "<a href=\"/download-only?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Download only</a>"
-    "<a href=\"/install-saved?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Install saved PKG with etaHEN</a>"
-    "<a href=\"/inspect-saved?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Inspect saved PKG (no install)</a>"
+    "<p>%s</p>%s"
     "<a href=\"/?platform_id=%ld&offset=%d\" tabindex=\"0\">&laquo; Back to list</a>"
     "</body></html>",
     fs_name_esc, platform_esc, size_str,
-    rom_id, platform_id, offset,
-    rom_id, platform_id, offset,
-    rom_id, platform_id, offset,
-    rom_id, platform_id, offset,
+    is_ps5 ? "ZIP/ZIP64 or PS5 images. Prepared to /data/homebrew for ShadowMountPlus; sources retained." : "PS4 .pkg; etaHEN DPI v2 required for installation.", actions,
     platform_id, offset);
 
   send_html_page(client_fd, html, html_len);
@@ -992,6 +1001,8 @@ inspect_pkg(const char *path, char content_id[49]) {
   return 0;
 }
 
+#include "ps5_files.h"
+
 static void *
 run_transfer(void *unused) {
   transfer_job_t job;
@@ -1004,9 +1015,19 @@ run_transfer(void *unused) {
   job = transfer_job;
   pthread_mutex_unlock(&transfer_lock);
   snprintf(result, sizeof result, "Could not reach RomM or read the selected file.");
-  if (lookup_platform_id(&job.cfg, job.auth, "ps4") != job.platform_id || job.platform_id < 0) {
-    snprintf(result, sizeof result, "Only PS4 PKG installation is supported."); goto done;
+  long ps4_id = lookup_platform_id(&job.cfg, job.auth, "ps4");
+  job.is_ps5 = 0;
+  if (job.platform_id < 0 || ps4_id != job.platform_id) {
+    long ps5_id = lookup_platform_id(&job.cfg, job.auth, "ps5");
+    if (job.platform_id < 0 || ps5_id < 0 || ps5_id != job.platform_id) {
+      snprintf(result, sizeof result, "Could not identify a supported PS4/PS5 platform. Check RomM connection.");
+      goto done;
+    }
+    job.is_ps5 = 1;
   }
+  pthread_mutex_lock(&transfer_lock);
+  transfer_job.is_ps5 = job.is_ps5;
+  pthread_mutex_unlock(&transfer_lock);
   snprintf(api_path, sizeof api_path, "/api/roms/%ld", job.rom_id);
   body = romm_get(&job.cfg, job.auth, api_path, &alloc);
   if (!body) goto done;
@@ -1014,17 +1035,30 @@ run_transfer(void *unused) {
   fs_name[0] = '\0';
   if (p) copy_json_string(p + strlen("\"fs_name\":\""), fs_name, sizeof fs_name);
   free(alloc); alloc = NULL;
-  if (strchr(fs_name, '/') || strchr(fs_name, '\\') || strlen(fs_name) < 5 ||
-      strcasecmp(fs_name + strlen(fs_name) - 4, ".pkg")) {
+  if (strchr(fs_name, '/') || strchr(fs_name, '\\') || strlen(fs_name) < 5) {
+    snprintf(result, sizeof result, "Select a single downloadable file."); goto done;
+  }
+  if (job.is_ps5) {
+    if (!ps5_suffix(fs_name, ".zip") && !ps5_image_ext(fs_name)) {
+      snprintf(result, sizeof result, "PS5: use ZIP/ZIP64, .ffpkg, .exfat, .ffpfs or .ffpfsc. RAR/7z, split archives and retail PS5 PKGs are not supported.");
+      goto done;
+    }
+    if (job.saved_only == INSPECT_SAVED) {
+      snprintf(result, sizeof result, "PKG inspection is for PS4. Use Prepare saved PS5 file."); goto done;
+    }
+  } else if (!ps5_suffix(fs_name, ".pkg")) {
     snprintf(result, sizeof result, "Select a single PS4 .pkg file."); goto done;
   }
-  snprintf(dest_path, sizeof dest_path, "%s/%s", DOWNLOAD_DIR, fs_name);
+  int path_len = snprintf(dest_path, sizeof dest_path, "%s/%s", DOWNLOAD_DIR, fs_name);
+  if (path_len < 0 || (size_t)path_len >= sizeof dest_path) {
+    snprintf(result, sizeof result, "Download path is too long."); goto done;
+  }
   if (!job.saved_only || job.saved_only == DOWNLOAD_ONLY) {
     url_encode(fs_name, encoded_name, sizeof encoded_name);
     snprintf(content_path, sizeof content_path, "/api/roms/%ld/content/%s", job.rom_id, encoded_name);
     mkdir("/data/romm-ps5", 0777);
     mkdir(DOWNLOAD_DIR, 0777);
-    transfer_message("Downloading PKG...");
+    transfer_message("Downloading file...");
     notify("RomM: downloading %s", fs_name);
     printf("[download] GET %s -> %s\n", content_path, dest_path);
     if (romm_download_to_file(&job.cfg, job.auth, content_path, dest_path)) {
@@ -1033,7 +1067,16 @@ run_transfer(void *unused) {
     }
     printf("[download] complete: %s\n", dest_path);
   } else if (job.saved_only != INSPECT_SAVED) {
-    printf("[install] using saved PKG: %s (no download)\n", dest_path);
+    printf("[job] using saved file: %s (no download)\n", dest_path);
+  }
+  if (job.is_ps5) {
+    if (job.saved_only == DOWNLOAD_ONLY) {
+      snprintf(result, sizeof result, "PS5 download complete. File saved; not extracted or prepared.");
+    } else {
+      transfer_message("Checking PS5 files...");
+      ps5_prepare(dest_path, fs_name, job.rom_id, result, sizeof result);
+    }
+    goto done;
   }
   transfer_message("Checking saved PKG...");
   if (inspect_pkg(dest_path, content_id)) {
@@ -1076,9 +1119,10 @@ serve_transfer_status(int client_fd) {
   html_escape(job.message, escaped, sizeof escaped);
   if (!job.active && job.rom_id >= 0) {
     snprintf(actions, sizeof actions,
-      "<a href=\"/install-saved?id=%ld&platform_id=%ld&offset=%d\">Install saved PKG with etaHEN</a>"
-      "<a href=\"/retry-download?id=%ld&platform_id=%ld&offset=%d\">Download and install again</a>",
-      job.rom_id, job.platform_id, job.offset, job.rom_id, job.platform_id, job.offset);
+      "<a href=\"/install-saved?id=%ld&platform_id=%ld&offset=%d\">%s</a>"
+      "<a href=\"/retry-download?id=%ld&platform_id=%ld&offset=%d\">%s</a>",
+      job.rom_id, job.platform_id, job.offset, job.is_ps5 ? "Prepare saved PS5 file" : "Install saved PKG with etaHEN",
+      job.rom_id, job.platform_id, job.offset, job.is_ps5 ? "Download and prepare again" : "Download and install again");
   }
   len = snprintf(html, sizeof html,
     "<!doctype html><html><head><meta charset=\"utf-8\">%s<title>RomM transfer</title>"

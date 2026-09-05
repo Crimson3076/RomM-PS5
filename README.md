@@ -49,7 +49,7 @@ Before running it, copy `app/romm_client/config.example.txt` to `app/romm_client
 
 ## On-Screen UI
 
-`app/romm_ui` reads `/data/romm-ps5/config.txt` and serves the console browser at `http://127.0.0.1:8081/`. It lists RomM platforms and games. PS4 single-file `.pkg` downloads are saved in `/data/romm-ps5/downloads/`. The game page offers **Download only**, **Download and install with etaHEN**, **Install saved PKG with etaHEN**, and read-only package inspection. PS5 archive installation is not implemented.
+`app/romm_ui` reads `/data/romm-ps5/config.txt` and serves the console browser at `http://127.0.0.1:8081/`. It lists RomM platforms and games. PS4 single-file `.pkg` downloads are saved in `/data/romm-ps5/downloads/`. The game page offers **Download only**, **Download and install with etaHEN**, **Install saved PKG with etaHEN**, and read-only package inspection. PS5 ZIP/ZIP64 archives and ShadowMountPlus images can be downloaded and prepared for scanning.
 
 Build and deploy it the same way as `romm_client`:
 
@@ -138,3 +138,43 @@ explicit retry actions are provided. Closing the browser does not cancel a job.
 Host tests cover the DPI wire protocol, escaped paths, acceptance versus failure,
 missing services, incomplete replies, and download-only isolation. Console testing
 is still required to verify the etaHEN handoff on the user's firmware.
+
+### PS5 formats and preparation
+
+| Input | Behavior |
+| --- | --- |
+| `.zip` / ZIP64 (stored or DEFLATE) | Extract one PS5 game folder, or one supported image |
+| `.ffpkg`, `.exfat` | Publish the completed image for ShadowMountPlus |
+| `.ffpfs`, `.ffpfsc` | Publish for ShadowMountPlus; these formats are experimental upstream |
+| `.rar`, `.7z`, split/encrypted archives, PS5 retail `.pkg` | Not supported; rejected before download |
+| Loose RomM directories | Package as a single ZIP first |
+
+PS5 game pages offer **Download and prepare PS5 game**, **Download only**, and
+**Prepare saved PS5 file (no download)**. A game-folder ZIP must contain exactly
+one `sce_sys/param.json` with a sibling `eboot.bin`. Files can be at the ZIP root
+or under wrapper directories. The detected game root is placed directly at
+`/data/homebrew/romm-<RomM-ID>/`, without extra nesting. A ZIP containing a single
+supported image produces `/data/homebrew/romm-<RomM-ID>.<image-extension>`.
+Ready-made image contents are validated by the mounter, not by RomM.
+
+These locations follow the default
+[ShadowMountPlus scan paths](https://github.com/drakmor/ShadowMountPlus#scan-paths).
+ShadowMountPlus must be running with compatible patches, and custom `scanpath`
+settings must include `/data/homebrew`. RomM prepares files; it does not report
+that a PS5 game has been installed or is playable. PS5 files never go to PS4 DPI.
+
+Downloads remain in `/data/romm-ps5/downloads/`. ZIPs are extracted into a private
+folder under `/data/romm-ps5/staging/`, with free-space preflight, streaming writes,
+CRC checks, and traversal/symlink rejection. Only a fully extracted source is
+moved into the scan directory. A failed extraction cleans up its own staging
+folder and keeps the source ZIP. An existing destination is never intentionally
+replaced; game updates/merging are not implemented. An interrupted payload may
+leave an unscanned staging folder for manual cleanup. Archives are retained, so
+space is needed for both the ZIP and extracted contents. Raw images use a hard
+link within internal storage, retaining the download without duplicating bytes.
+
+ZIP64 parsing uses vendored miniz 3.1.0, pinned in `vendor/miniz/ROMM_VENDOR.md`,
+with 64-bit file offsets and callback extraction. No external unzip binary or
+system zlib is required. Archives are limited to 100,000 entries and 32 levels
+of nesting. Host tests use ZIP64 fixtures; multi-gigabyte console transfers and
+actual ShadowMountPlus discovery still require on-device testing.

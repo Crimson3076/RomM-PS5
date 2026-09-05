@@ -27,11 +27,13 @@ ELF := romm_ui.elf
 
 CFLAGS := -Wall -Werror -g
 CFLAGS += -lpthread
+CFLAGS += -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ZLIB_APIS -DMINIZ_NO_TIME
+MINIZ_SRC := vendor/miniz/miniz.c vendor/miniz/miniz_tinfl.c vendor/miniz/miniz_zip.c
 
 all: $(ELF)
 
-$(ELF): main.c pkg_diagnostics.h etahen_client.h
-	$(CC) $(CFLAGS) -o $@ main.c
+$(ELF): main.c pkg_diagnostics.h etahen_client.h ps5_files.h $(MINIZ_SRC) $(wildcard vendor/miniz/*.h)
+	$(CC) $(CFLAGS) -o $@ main.c $(MINIZ_SRC)
 
 clean:
 	rm -f $(ELF)

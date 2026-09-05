@@ -4,6 +4,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+from build_support import MINIZ_ARGS
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 
@@ -38,7 +39,7 @@ int main(int argc, char **argv) {
 }
 ''')
         cls.exe = cls.root / 'test'
-        subprocess.run(['cc', '-Wall', '-Werror', '-pthread', '-I', str(ROOT),
+        subprocess.run(['cc', *MINIZ_ARGS, '-Wall', '-Werror', '-pthread', '-I', str(ROOT),
                         f'-DDOWNLOAD_DIR="{cls.root}"', str(src), '-o', str(cls.exe)], check=True)
 
     @classmethod
