@@ -30,9 +30,12 @@ along with this program; see the file COPYING. If not, see
 #define RECV_BUF_SIZE 65536
 #define REQ_BUF_SIZE 2048
 
-int sceUserServiceInitialize(void*);
-int sceUserServiceTerminate(void);
-int sceSystemServiceLaunchWebBrowser(const char *uri, void*);
+typedef struct notify_request {
+  char useless1[45];
+  char message[3075];
+} notify_request_t;
+
+int sceKernelSendNotificationRequest(int, notify_request_t*, size_t, int);
 
 typedef struct {
   char host[128];
@@ -40,6 +43,20 @@ typedef struct {
   char user[64];
   char pass[64];
 } config_t;
+
+
+static void
+notify(const char *fmt, ...) {
+  notify_request_t req;
+  va_list ap;
+
+  bzero(&req, sizeof req);
+  va_start(ap, fmt);
+  vsnprintf(req.message, sizeof req.message, fmt, ap);
+  va_end(ap);
+
+  sceKernelSendNotificationRequest(0, &req, sizeof req, 0);
+}
 
 
 static int
@@ -625,11 +642,7 @@ main() {
     return 1;
   }
 
-  if (sceUserServiceInitialize(0) != 0) {
-    close(listen_fd);
-    return 1;
-  }
-  sceSystemServiceLaunchWebBrowser("http://127.0.0.1:" UI_PORT "/", 0);
+  notify("RomM: open the PS5 Browser and go to http://127.0.0.1:" UI_PORT "/");
 
   for (;;) {
     int client_fd = accept(listen_fd, NULL, NULL);
@@ -664,7 +677,6 @@ main() {
     }
   }
 
-  sceUserServiceTerminate();
   close(listen_fd);
   return 0;
 }

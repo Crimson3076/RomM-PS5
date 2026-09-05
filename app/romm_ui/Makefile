@@ -26,7 +26,6 @@ endif
 ELF := romm_ui.elf
 
 CFLAGS := -Wall -Werror -g
-CFLAGS += -lSceSystemService -lSceUserService
 
 all: $(ELF)
 
