@@ -1024,7 +1024,8 @@ serve_installer_pkg(int client_fd, const char *headers, int head_only) {
       "Accept-Ranges: bytes\r\nContent-Length: %llu\r\n"
       "Connection: close\r\n\r\n", size);
   }
-  if (send_all(client_fd, response, (size_t)response_len) || head_only) {
+  send_all(client_fd, response, (size_t)response_len);
+  if (head_only) {
     close(client_fd);
     return;
   }
@@ -1039,7 +1040,8 @@ serve_installer_pkg(int client_fd, const char *headers, int head_only) {
   while (remaining) {
     size_t want = remaining > sizeof buf ? sizeof buf : (size_t)remaining;
     size_t got = fread(buf, 1, want, fp);
-    if (!got || send_all(client_fd, buf, got)) break;
+    if (!got) break;
+    send_all(client_fd, buf, got);
     remaining -= got;
   }
   fclose(fp);
