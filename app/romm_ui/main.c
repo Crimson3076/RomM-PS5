@@ -520,7 +520,7 @@ serve_page(int client_fd, const config_t *cfg, const char *auth_b64,
   html_len += snprintf(html + html_len, html_cap - html_len, __VA_ARGS__)
 
   snprintf(api_path, sizeof api_path,
-           "/api/roms?limit=%d&offset=%d&platform_id=%ld",
+           "/api/roms?limit=%d&offset=%d&platform_ids=%ld",
            ROMS_PER_PAGE, offset, platform_id);
   body = romm_get(cfg, auth_b64, api_path, &alloc);
 
