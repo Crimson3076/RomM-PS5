@@ -133,16 +133,37 @@ ps5_prepare(const char *source, const char *name, long rom_id, char *result, siz
   }
   opened = 1;
   count = mz_zip_reader_get_num_files(&zip);
-  if (!count || count > 100000) goto invalid;
+  printf("[ps5] ZIP%s preflight entries=%u\n", mz_zip_is_zip64(&zip) ? "64" : "", count);
+  /* miniz validates and allocates the central directory. Real PS5 games can
+     exceed 100,000 entries; validate every entry instead of imposing that cap. */
+  if (!count) {
+    snprintf(result, result_size, "ZIP is empty. ZIP retained.");
+    goto done;
+  }
   for (mz_uint i = 0; i < count; i++) {
     char entry[768];
     mz_zip_archive_file_stat info;
-    if (ps5_zip_name(&zip, i, entry) || !mz_zip_reader_file_stat(&zip, i, &info)) goto invalid;
+    if (ps5_zip_name(&zip, i, entry)) {
+      snprintf(result, result_size, "ZIP entry %u has an unsafe or overlong path. ZIP retained.", i);
+      goto done;
+    }
+    if (!mz_zip_reader_file_stat(&zip, i, &info)) {
+      snprintf(result, result_size, "Cannot read ZIP entry %u metadata. ZIP retained.", i);
+      goto done;
+    }
     unsigned type = (info.m_external_attr >> 16) & 0170000;
     if ((type && type != 0100000 && type != 0040000) || info.m_is_encrypted ||
-        !info.m_is_supported || (info.m_method != 0 && info.m_method != 8)) goto invalid;
+        !info.m_is_supported || (info.m_method != 0 && info.m_method != 8)) {
+      printf("[ps5] rejected entry=%s type=%o encrypted=%u supported=%u method=%u\n",
+             entry, type, info.m_is_encrypted, info.m_is_supported, info.m_method);
+      snprintf(result, result_size, "ZIP entry %u has unsupported type/compression or encryption. See terminal. ZIP retained.", i);
+      goto done;
+    }
     if (info.m_is_directory) continue;
-    if (UINT64_MAX - expanded < info.m_uncomp_size) goto invalid;
+    if (UINT64_MAX - expanded < info.m_uncomp_size) {
+      snprintf(result, result_size, "ZIP expanded size overflows at entry %u. ZIP retained.", i);
+      goto done;
+    }
     expanded += info.m_uncomp_size;
     const char *marker = "sce_sys/param.json";
     size_t len = strlen(entry), mlen = strlen(marker);
@@ -158,11 +179,18 @@ ps5_prepare(const char *source, const char *name, long rom_id, char *result, siz
     snprintf(eboot, sizeof eboot, "%seboot.bin", root);
     int index = mz_zip_reader_locate_file(&zip, eboot, NULL, MZ_ZIP_FLAG_CASE_SENSITIVE);
     mz_zip_archive_file_stat info;
-    if (index < 0 || !mz_zip_reader_file_stat(&zip, (mz_uint)index, &info) || info.m_is_directory || !info.m_uncomp_size) goto invalid;
+    if (index < 0 || !mz_zip_reader_file_stat(&zip, (mz_uint)index, &info) || info.m_is_directory || !info.m_uncomp_size) {
+      printf("[ps5] missing or invalid executable=%s\n", eboot);
+      snprintf(result, result_size, "ZIP game root lacks a nonempty eboot.bin. ZIP retained.");
+      goto done;
+    }
     snprintf(final, sizeof final, "%s/romm-%ld", PS5_GAME_DIR, rom_id);
   } else if (!roots && images == 1) {
     snprintf(final, sizeof final, "%s/romm-%ld%s", PS5_GAME_DIR, rom_id, ps5_image_ext(image_name));
-  } else goto invalid;
+  } else {
+    snprintf(result, result_size, "ZIP contains %u game roots and %u PS5 images; expected one game root or one image. ZIP retained.", roots, images);
+    goto done;
+  }
   if (!lstat(final, &st) || errno != ENOENT) {
     snprintf(result, result_size, "PS5 destination already exists. It was not replaced. Source retained.");
     goto done;
@@ -219,8 +247,6 @@ published:
   printf("[ps5] prepared=%s; ShadowMountPlus scan required\n", final);
   snprintf(result, result_size, "PS5 files ready at %.120s. ShadowMountPlus must scan them; launch compatibility is not verified.", final);
   goto done;
-invalid:
-  snprintf(result, result_size, "Unsupported ZIP layout/entry. Use one game folder (eboot.bin + sce_sys/param.json) or one PS5 image. ZIP retained.");
 done:
   if (opened) mz_zip_reader_end(&zip);
   if (stage[0]) ps5_remove_stage(stage);

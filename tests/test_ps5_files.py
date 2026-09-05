@@ -76,11 +76,11 @@ int main(int argc, char **argv) {
                     z.writestr(name, data)
         return buf.getvalue()
 
-    def prepare(self, data, success=True, filename='game.zip'):
+    def prepare(self, data, success=True, filename='game.zip', timeout=8):
         path = self.root / filename
         path.write_bytes(data)
         result = subprocess.run([str(self.exe), str(self.root), str(path)],
-                                capture_output=True, text=True, timeout=8)
+                                capture_output=True, text=True, timeout=timeout)
         self.assertEqual(result.returncode, 0 if success else 1, result.stdout + result.stderr)
         self.assertEqual(path.read_bytes(), data)
         self.assertEqual(list((self.root / 'stage').iterdir()), [])
@@ -97,6 +97,19 @@ int main(int argc, char **argv) {
     def test_root_stored_zip64(self):
         self.prepare(self.archive(compression=zipfile.ZIP_STORED, zip64=True))
         self.assertTrue((self.root / 'games/romm-7/sce_sys/param.json').exists())
+
+    def test_large_zip64_game_entry_count(self):
+        # Match the reported ASTRO BOT entry count with small synthetic files.
+        data = self.archive(extra=((f'assets/file-{i}.bin', b'x') for i in range(158202)))
+        result = self.prepare(data, timeout=120)
+        self.assertIn('preflight entries=158205', result.stdout)
+        self.assertEqual((self.root / 'games/romm-7/assets/file-158201.bin').read_bytes(), b'x')
+
+    def test_empty_zip_diagnostic(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w'):
+            pass
+        self.assertIn('ZIP is empty', self.prepare(buf.getvalue(), success=False).stdout)
 
     def test_traversal_and_absolute_paths(self):
         for name in ('../escape', '/escape', 'C:/escape', 'a/../../escape', 'a\\escape', './escape'):
