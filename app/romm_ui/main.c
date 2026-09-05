@@ -20,6 +20,7 @@ along with this program; see the file COPYING. If not, see
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -29,6 +30,7 @@ along with this program; see the file COPYING. If not, see
 #define ROMS_PER_PAGE 20
 #define RECV_BUF_SIZE 65536
 #define REQ_BUF_SIZE 2048
+#define DOWNLOAD_DIR "/data/romm-ps5/downloads"
 
 typedef struct notify_request {
   char useless1[45];
@@ -36,6 +38,32 @@ typedef struct notify_request {
 } notify_request_t;
 
 int sceKernelSendNotificationRequest(int, notify_request_t*, size_t, int);
+
+typedef struct pkg_metadata {
+  const char *uri;
+  const char *ex_uri;
+  const char *playgo_scenario_id;
+  const char *content_id;
+  const char *content_name;
+  const char *icon_url;
+} pkg_metadata_t;
+
+typedef struct pkg_info {
+  char content_id[48];
+  int type;
+  int platform;
+} pkg_info_t;
+
+typedef struct playgo_info {
+  char lang[8][30];
+  char scenario_ids[3][64];
+  char content_ids[64];
+  long unknown[810];
+} playgo_info_t;
+
+int sceAppInstUtilInitialize(void);
+int sceAppInstUtilInstallByPackage(const pkg_metadata_t*, pkg_info_t*,
+                                    playgo_info_t*);
 
 typedef struct {
   char host[128];
@@ -250,6 +278,118 @@ romm_get(const config_t *cfg, const char *auth_b64, const char *path,
 
   *out_alloc = response;
   return body;
+}
+
+
+/* Percent-encode a single path segment for use in an HTTP request path. */
+static void
+url_encode(const char *in, char *out, size_t out_size) {
+  static const char hex[] = "0123456789ABCDEF";
+  const unsigned char *p;
+  size_t oi = 0;
+
+  for (p = (const unsigned char *)in; *p != '\0' && oi + 4 < out_size; p++) {
+    unsigned char c = *p;
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+        c == '.' || c == '~') {
+      out[oi++] = (char)c;
+    } else {
+      out[oi++] = '%';
+      out[oi++] = hex[(c >> 4) & 0xF];
+      out[oi++] = hex[c & 0xF];
+    }
+  }
+  out[oi < out_size ? oi : out_size - 1] = '\0';
+}
+
+
+/* Stream a GET response body directly to a local file, without buffering
+   the whole thing in memory -- needed for multi-gigabyte ROM downloads.
+   Returns 0 on success (HTTP 200 and clean connection close), -1 on any
+   failure (removing any partial file written). */
+static int
+romm_download_to_file(const config_t *cfg, const char *auth_b64,
+                       const char *path, const char *dest_path) {
+  char request[512];
+  int sock;
+  FILE *fp;
+  char buf[65536];
+  ssize_t n;
+  int header_done = 0;
+  int ok = 0;
+  char header_buf[4096];
+  size_t header_len = 0;
+
+  sock = connect_host(cfg->host, cfg->port);
+  if (sock < 0) {
+    return -1;
+  }
+
+  snprintf(request, sizeof request,
+           "GET %s HTTP/1.1\r\n"
+           "Host: %s\r\n"
+           "Authorization: Basic %s\r\n"
+           "Connection: close\r\n"
+           "\r\n",
+           path, cfg->host, auth_b64);
+
+  if (send(sock, request, strlen(request), 0) < 0) {
+    close(sock);
+    return -1;
+  }
+
+  fp = fopen(dest_path, "wb");
+  if (fp == NULL) {
+    close(sock);
+    return -1;
+  }
+
+  while ((n = recv(sock, buf, sizeof buf, 0)) > 0) {
+    if (header_done) {
+      fwrite(buf, 1, (size_t)n, fp);
+      continue;
+    }
+
+    {
+      size_t copy_len = (size_t)n;
+      char *marker;
+
+      if (header_len + copy_len >= sizeof header_buf) {
+        copy_len = sizeof header_buf - 1 - header_len;
+      }
+      memcpy(header_buf + header_len, buf, copy_len);
+      header_len += copy_len;
+      header_buf[header_len] = '\0';
+
+      marker = strstr(header_buf, "\r\n\r\n");
+      if (marker != NULL) {
+        size_t header_bytes = (size_t)(marker + 4 - header_buf);
+        size_t leftover = header_len - header_bytes;
+
+        header_done = 1;
+        ok = (strncmp(header_buf, "HTTP/1.1 200", 12) == 0 ||
+              strncmp(header_buf, "HTTP/1.0 200", 12) == 0);
+        if (!ok) {
+          break;
+        }
+        if (leftover > 0) {
+          fwrite(marker + 4, 1, leftover, fp);
+        }
+      } else if (header_len >= sizeof header_buf - 1) {
+        break;
+      }
+    }
+  }
+
+  fclose(fp);
+  close(sock);
+
+  if (!ok) {
+    remove(dest_path);
+    return -1;
+  }
+  return 0;
 }
 
 
@@ -744,7 +884,7 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
 
 
 static void
-serve_download_placeholder(int client_fd, long rom_id, long platform_id,
+serve_unsupported_platform(int client_fd, long rom_id, long platform_id,
                             int offset) {
   char html[1024];
   size_t html_len = snprintf(html, sizeof html,
@@ -754,11 +894,159 @@ serve_download_placeholder(int client_fd, long rom_id, long platform_id,
     "font-size:2.2vw}"
     "a{color:#8cf;display:block;padding:1.5vw;text-decoration:none}"
     "a:focus,a:hover{background:#8cf;color:#111}</style></head><body>"
-    "<h1>Download not implemented yet</h1>"
-    "<p>Rom #%ld is queued for a future milestone -- the actual download "
-    "pipeline hasn't been built yet.</p>"
+    "<h1>Download not implemented for this platform yet</h1>"
+    "<p>Only PS4 titles support automatic download+install right now. "
+    "PS5 zip extraction is a separate, harder future milestone.</p>"
     "<a href=\"/rom?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">"
-    "&laquo; Back</a></body></html>", rom_id, rom_id, platform_id, offset);
+    "&laquo; Back</a></body></html>", rom_id, platform_id, offset);
+  send_html_page(client_fd, html, html_len);
+  close(client_fd);
+}
+
+
+static void
+serve_error_page(int client_fd, const char *message, long rom_id,
+                  long platform_id, int offset) {
+  char html[2048];
+  char message_esc[512];
+  size_t html_len;
+
+  html_escape(message, message_esc, sizeof message_esc);
+  html_len = snprintf(html, sizeof html,
+    "<!doctype html><html><head><meta charset=\"utf-8\">"
+    "<title>RomM</title>"
+    "<style>body{background:#111;color:#eee;font-family:sans-serif;"
+    "font-size:2.2vw}"
+    "a{color:#8cf;display:block;padding:1.5vw;text-decoration:none}"
+    "a:focus,a:hover{background:#8cf;color:#111}</style></head><body>"
+    "<h1>%s</h1>"
+    "<a href=\"/rom?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">"
+    "&laquo; Back</a></body></html>", message_esc, rom_id, platform_id,
+    offset);
+  send_html_page(client_fd, html, html_len);
+  close(client_fd);
+}
+
+
+static void
+serve_download(int client_fd, const config_t *cfg, const char *auth_b64,
+               long rom_id, long platform_id, int offset) {
+  long ps4_id;
+  char api_path[64];
+  char *alloc = NULL;
+  char *body;
+  const char *p;
+  char fs_name[256];
+  char fs_name_esc[512];
+  char html[2048];
+  size_t html_len;
+
+  ps4_id = lookup_platform_id(cfg, auth_b64, "ps4");
+  if (ps4_id < 0 || platform_id != ps4_id) {
+    serve_unsupported_platform(client_fd, rom_id, platform_id, offset);
+    return;
+  }
+
+  snprintf(api_path, sizeof api_path, "/api/roms/%ld", rom_id);
+  body = romm_get(cfg, auth_b64, api_path, &alloc);
+  if (body == NULL) {
+    serve_error_page(client_fd, "Could not reach RomM server.",
+                      rom_id, platform_id, offset);
+    return;
+  }
+
+  p = strstr(body, "\"fs_name\":\"");
+  if (p != NULL) {
+    copy_json_string(p + strlen("\"fs_name\":\""), fs_name, sizeof fs_name);
+  } else {
+    fs_name[0] = '\0';
+  }
+  free(alloc);
+
+  if (fs_name[0] == '\0') {
+    serve_error_page(client_fd, "Could not determine the rom's file name.",
+                      rom_id, platform_id, offset);
+    return;
+  }
+
+  html_escape(fs_name, fs_name_esc, sizeof fs_name_esc);
+
+  {
+    char encoded_name[512];
+    char content_path[800];
+    char dest_path[600];
+    int rc;
+
+    url_encode(fs_name, encoded_name, sizeof encoded_name);
+    snprintf(content_path, sizeof content_path,
+             "/api/roms/%ld/content/%s", rom_id, encoded_name);
+
+    mkdir("/data/romm-ps5", 0777);
+    mkdir(DOWNLOAD_DIR, 0777);
+    snprintf(dest_path, sizeof dest_path, "%s/%s", DOWNLOAD_DIR, fs_name);
+
+    notify("RomM: downloading %s ...", fs_name);
+    rc = romm_download_to_file(cfg, auth_b64, content_path, dest_path);
+    if (rc != 0) {
+      notify("RomM: download failed for %s", fs_name);
+      serve_error_page(client_fd, "Download failed.",
+                        rom_id, platform_id, offset);
+      return;
+    }
+
+    notify("RomM: download complete, installing %s ...", fs_name);
+
+    {
+      pkg_metadata_t metainfo;
+      pkg_info_t pkginfo;
+      playgo_info_t playgoinfo;
+      int err;
+      int i;
+
+      memset(&metainfo, 0, sizeof metainfo);
+      memset(&pkginfo, 0, sizeof pkginfo);
+      memset(&playgoinfo, 0, sizeof playgoinfo);
+
+      metainfo.uri = dest_path;
+      metainfo.ex_uri = "";
+      metainfo.playgo_scenario_id = "";
+      metainfo.content_id = "";
+      metainfo.icon_url = "";
+      metainfo.content_name = dest_path;
+      for (i = 0; dest_path[i] != '\0'; i++) {
+        if (dest_path[i] == '/') {
+          metainfo.content_name = dest_path + i + 1;
+        }
+      }
+
+      err = sceAppInstUtilInitialize();
+      if (err != 0) {
+        notify("RomM: sceAppInstUtilInitialize failed: 0x%x", err);
+      } else {
+        err = sceAppInstUtilInstallByPackage(&metainfo, &pkginfo,
+                                              &playgoinfo);
+        if (err == 0) {
+          notify("RomM: install started for %s", fs_name);
+        } else {
+          notify("RomM: install failed: 0x%x", err);
+        }
+      }
+    }
+  }
+
+  html_len = snprintf(html, sizeof html,
+    "<!doctype html><html><head><meta charset=\"utf-8\">"
+    "<title>RomM</title>"
+    "<style>body{background:#111;color:#eee;font-family:sans-serif;"
+    "font-size:2.2vw}"
+    "a{color:#8cf;display:block;padding:1.5vw;text-decoration:none}"
+    "a:focus,a:hover{background:#8cf;color:#111}</style></head><body>"
+    "<h1>%s</h1>"
+    "<p>Downloaded and install triggered. Check the PS5 notifications "
+    "for the result.</p>"
+    "<a href=\"/rom?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">"
+    "&laquo; Back</a></body></html>", fs_name_esc, rom_id, platform_id,
+    offset);
   send_html_page(client_fd, html, html_len);
   close(client_fd);
 }
@@ -846,7 +1134,8 @@ main() {
       serve_rom_details(client_fd, &cfg, auth_b64, rom_id, platform_id,
                          (int)offset);
     } else if (strcmp(path, "/download") == 0 && rom_id >= 0) {
-      serve_download_placeholder(client_fd, rom_id, platform_id, (int)offset);
+      serve_download(client_fd, &cfg, auth_b64, rom_id, platform_id,
+                      (int)offset);
     } else if (platform_id < 0) {
       serve_picker(client_fd, &cfg, auth_b64);
     } else {
