@@ -88,7 +88,7 @@ Transfers are written to `.part` files, checked against the declared byte count,
 and renamed only after successful writes and close. This checks transfer
 completeness, not package authenticity or install compatibility. A failed
 transfer preserves an existing completed file. Socket reads/writes time out
-after 60 seconds of inactivity. The UI remains synchronous during downloads.
+after 60 seconds of inactivity. Downloads run in a background worker; the browser redirects immediately to a read-only status page.
 
 Capture payload stdout with `tools/deploy_payload.py`. Failure lines include
 HTTP status and received/expected bytes, without authentication headers. A
@@ -103,3 +103,29 @@ python3 -m unittest discover -s tests -v
 
 Console validation still requires building with the PS5 payload SDK and testing
 against a real RomM server and PS5.
+
+### Installer retry revision
+
+The PlayGo output buffer now matches the 9,984-byte layout in the
+[etaHEN package installation writeup](https://github.com/etaHEN/etaHEN/blob/main/PS5%20technical%20writeups/pkg-writeup.md).
+The previous 6,976-byte buffer was undersized. Compile-time assertions check
+its size and field offsets. The package-info argument remains a zeroed output
+structure; an empty value in the native log alone does not diagnose a failure.
+The package content ID is read from the header and supplied as input metadata.
+The exact cause of console error `0x80b2116f` remains unconfirmed pending retest.
+
+On a game page, **Install saved PKG (no download)** reuses the existing file in
+`/data/romm-ps5/downloads/`. It never requests the content endpoint. It requires
+RomM metadata access to identify the saved filename. A preflight checks PS4 CNT
+magic, a printable content ID, and file size against the big-endian package-size
+field documented by [LibOrbisPkg](https://github.com/maxton/LibOrbisPkg/blob/master/LibOrbisPkg/PKG/PkgReader.cs).
+This does not verify signatures or every package entry. A failed preflight
+retains the file and does not call the installer.
+
+Download and installation work runs in one background worker. `/status` displays
+byte counts and refreshes every three seconds while active. Progress also prints
+to stdout about every five seconds during transfer. Repeated original Download
+URLs return the active/latest result for that ROM rather than restarting it;
+explicit retry actions are provided. Closing or refreshing the browser does not
+cancel a job. Installation accepted means the native request returned success,
+not that asynchronous installation has completed; check PS5 notifications.

@@ -26,7 +26,7 @@ endif
 ELF := romm_ui.elf
 
 CFLAGS := -Wall -Werror -g
-CFLAGS += -lSceIpmi -lSceAppInstUtil
+CFLAGS += -lSceIpmi -lSceAppInstUtil -lpthread
 
 all: $(ELF)
 

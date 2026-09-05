@@ -18,6 +18,10 @@ along with this program; see the file COPYING. If not, see
 #include <stdlib.h>
 #include <errno.h>
 #include <stdint.h>
+#include <stddef.h>
+#include <pthread.h>
+#include <signal.h>
+#include <time.h>
 #include <strings.h>
 #include <sys/time.h>
 #include <stdarg.h>
@@ -59,11 +63,16 @@ typedef struct pkg_info {
 } pkg_info_t;
 
 typedef struct playgo_info {
-  char lang[8][30];
-  char scenario_ids[3][64];
-  char content_ids[64];
-  long unknown[810];
+  char lang[30][8];
+  char scenario_ids[64][3];
+  char content_ids[64][48];
+  unsigned char unknown[6480];
 } playgo_info_t;
+
+/* Layout documented by etaHEN's PS5 package-installation writeup. */
+_Static_assert(offsetof(playgo_info_t, content_ids) == 432, "PlayGo content IDs offset");
+_Static_assert(offsetof(playgo_info_t, unknown) == 3504, "PlayGo reserved offset");
+_Static_assert(sizeof(playgo_info_t) == 9984, "PlayGo ABI size");
 
 int sceAppInstUtilInitialize(void);
 int sceAppInstUtilInstallByPackage(const pkg_metadata_t*, pkg_info_t*,
@@ -75,6 +84,34 @@ typedef struct {
   char user[64];
   char pass[64];
 } config_t;
+
+
+typedef struct {
+  config_t cfg;
+  char auth[256];
+  long rom_id, platform_id;
+  int offset, saved_only, active;
+  unsigned long long received, expected;
+  char message[256];
+} transfer_job_t;
+
+static transfer_job_t transfer_job = {.rom_id = -1};
+static pthread_mutex_t transfer_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+transfer_message(const char *message) {
+  pthread_mutex_lock(&transfer_lock);
+  snprintf(transfer_job.message, sizeof transfer_job.message, "%s", message);
+  pthread_mutex_unlock(&transfer_lock);
+}
+
+static void
+transfer_progress(unsigned long long received, unsigned long long expected) {
+  pthread_mutex_lock(&transfer_lock);
+  transfer_job.received = received;
+  transfer_job.expected = expected;
+  pthread_mutex_unlock(&transfer_lock);
+}
 
 
 static void
@@ -322,6 +359,7 @@ romm_download_to_file(const config_t *cfg, const char *auth_b64,
   struct timeval timeout = {60, 0};
   int len;
   ssize_t n;
+  time_t last_progress = 0;
 
   len = snprintf(part, sizeof part, "%s.part", dest_path);
   if (len < 0 || (size_t)len >= sizeof part) return -1;
@@ -397,6 +435,7 @@ romm_download_to_file(const config_t *cfg, const char *auth_b64,
   fflush(stdout);
   fp = fopen(part, "wb");
   if (!fp) { failure = "cannot open temporary download file"; goto done; }
+  transfer_progress(0, expected);
   part_created = 1;
   while (received < expected) {
     size_t want = expected - received > sizeof buf ? sizeof buf :
@@ -408,6 +447,12 @@ romm_download_to_file(const config_t *cfg, const char *auth_b64,
       failure = "disk write failed (check free space)"; goto done;
     }
     received += (unsigned long long)n;
+    transfer_progress(received, expected);
+    if (time(NULL) - last_progress >= 5 || received == expected) {
+      printf("[download] progress=%llu/%llu bytes (%.1f%%)\n",
+             received, expected, 100.0 * (double)received / (double)expected);
+      last_progress = time(NULL);
+    }
   }
   if (fclose(fp)) {
     fp = NULL; failure = "disk flush failed"; goto done;
@@ -663,7 +708,8 @@ serve_picker(int client_fd, const config_t *cfg, const char *auth_b64) {
 
   header_len = snprintf(header, sizeof header,
                          "HTTP/1.1 200 OK\r\n"
-                         "Content-Type: text/html; charset=utf-8\r\n"
+                         "Cache-Control: no-store\r\n"
+                             "Content-Type: text/html; charset=utf-8\r\n"
                          "Content-Length: %zu\r\n"
                          "Connection: close\r\n"
                          "\r\n", html_len);
@@ -793,7 +839,8 @@ serve_page(int client_fd, const config_t *cfg, const char *auth_b64,
     char header[256];
     int header_len = snprintf(header, sizeof header,
                                "HTTP/1.1 200 OK\r\n"
-                               "Content-Type: text/html; charset=utf-8\r\n"
+                               "Cache-Control: no-store\r\n"
+                             "Content-Type: text/html; charset=utf-8\r\n"
                                "Content-Length: %zu\r\n"
                                "Connection: close\r\n"
                                "\r\n", html_len);
@@ -811,6 +858,7 @@ send_html_page(int client_fd, const char *html, size_t html_len) {
   char header[256];
   int header_len = snprintf(header, sizeof header,
                              "HTTP/1.1 200 OK\r\n"
+                             "Cache-Control: no-store\r\n"
                              "Content-Type: text/html; charset=utf-8\r\n"
                              "Content-Length: %zu\r\n"
                              "Connection: close\r\n"
@@ -910,9 +958,11 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
     "<p>Platform: %s</p>"
     "<p>Size: %s</p>"
     "<a href=\"/download?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Download</a>"
+    "<a href=\"/install-saved?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Install saved PKG (no download)</a>"
     "<a href=\"/?platform_id=%ld&offset=%d\" tabindex=\"0\">&laquo; Back to list</a>"
     "</body></html>",
     fs_name_esc, platform_esc, size_str,
+    rom_id, platform_id, offset,
     rom_id, platform_id, offset,
     platform_id, offset);
 
@@ -921,199 +971,206 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
 }
 
 
-static void
-serve_unsupported_platform(int client_fd, long rom_id, long platform_id,
-                            int offset) {
-  char html[1024];
-  size_t html_len = snprintf(html, sizeof html,
-    "<!doctype html><html><head><meta charset=\"utf-8\">"
-    "<title>RomM</title>"
-    "<style>body{background:#111;color:#eee;font-family:sans-serif;"
-    "font-size:2.2vw}"
-    "a{color:#8cf;display:block;padding:1.5vw;text-decoration:none}"
-    "a:focus,a:hover{background:#8cf;color:#111}</style></head><body>"
-    "<h1>Download not implemented for this platform yet</h1>"
-    "<p>Only PS4 titles support automatic download+install right now. "
-    "PS5 zip extraction is a separate, harder future milestone.</p>"
-    "<a href=\"/rom?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">"
-    "&laquo; Back</a></body></html>", rom_id, platform_id, offset);
-  send_html_page(client_fd, html, html_len);
-  close(client_fd);
+/* Header offsets match LibOrbisPkg/PKG/PkgReader.cs. This verifies the
+   container header and size only, not signatures or every package entry. */
+static int
+inspect_pkg(const char *path, char content_id[49]) {
+  unsigned char header[0x438];
+  unsigned long long declared = 0;
+  struct stat st;
+  FILE *fp = fopen(path, "rb");
+  size_t n, i;
+  if (!fp) { printf("[pkg] cannot open file: errno=%d\n", errno); return -1; }
+  if (fstat(fileno(fp), &st) || !S_ISREG(st.st_mode)) {
+    fclose(fp); return -1;
+  }
+  n = fread(header, 1, sizeof header, fp);
+  fclose(fp);
+  if (n != sizeof header || memcmp(header, "\x7f" "CNT", 4)) {
+    printf("[pkg] missing PS4 CNT header\n"); return -1;
+  }
+  for (i = 0x430; i < 0x438; i++) declared = (declared << 8) | header[i];
+  memcpy(content_id, header + 0x40, 48);
+  content_id[48] = '\0';
+  for (i = 0; i < 48 && content_id[i]; i++) {
+    unsigned char c = (unsigned char)content_id[i];
+    if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+      printf("[pkg] invalid content ID\n"); return -1;
+    }
+  }
+  if (!i || i == 48 || declared < sizeof header ||
+      declared != (unsigned long long)st.st_size) {
+    printf("[pkg] invalid ID or size: header=%llu file=%llu\n",
+           declared, (unsigned long long)st.st_size);
+    return -1;
+  }
+  printf("[pkg] content_id=%s header_size=%llu file_size=%llu\n",
+         content_id, declared, (unsigned long long)st.st_size);
+  return 0;
 }
 
-
-static void
-serve_error_page(int client_fd, const char *message, long rom_id,
-                  long platform_id, int offset) {
-  char html[2048];
-  char message_esc[512];
-  size_t html_len;
-
-  html_escape(message, message_esc, sizeof message_esc);
-  html_len = snprintf(html, sizeof html,
-    "<!doctype html><html><head><meta charset=\"utf-8\">"
-    "<title>RomM</title>"
-    "<style>body{background:#111;color:#eee;font-family:sans-serif;"
-    "font-size:2.2vw}"
-    "a{color:#8cf;display:block;padding:1.5vw;text-decoration:none}"
-    "a:focus,a:hover{background:#8cf;color:#111}</style></head><body>"
-    "<h1>%s</h1>"
-    "<a href=\"/rom?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">"
-    "&laquo; Back</a></body></html>", message_esc, rom_id, platform_id,
-    offset);
-  send_html_page(client_fd, html, html_len);
-  close(client_fd);
+static void *
+run_transfer(void *unused) {
+  transfer_job_t job;
+  char api_path[64], fs_name[256], encoded_name[768], content_path[800];
+  char dest_path[600], content_id[49], result[256];
+  char *alloc = NULL, *body;
+  const char *p;
+  pkg_metadata_t metainfo;
+  pkg_info_t pkginfo = {0};
+  playgo_info_t playgoinfo = {0};
+  static int installer_initialized = 0; /* one worker at a time */
+  int err;
+  (void)unused;
+  pthread_mutex_lock(&transfer_lock);
+  job = transfer_job;
+  pthread_mutex_unlock(&transfer_lock);
+  snprintf(result, sizeof result, "Could not reach RomM or read the selected file.");
+  if (lookup_platform_id(&job.cfg, job.auth, "ps4") != job.platform_id || job.platform_id < 0) {
+    snprintf(result, sizeof result, "Only PS4 PKG installation is supported."); goto done;
+  }
+  snprintf(api_path, sizeof api_path, "/api/roms/%ld", job.rom_id);
+  body = romm_get(&job.cfg, job.auth, api_path, &alloc);
+  if (!body) goto done;
+  p = strstr(body, "\"fs_name\":\"");
+  fs_name[0] = '\0';
+  if (p) copy_json_string(p + strlen("\"fs_name\":\""), fs_name, sizeof fs_name);
+  free(alloc); alloc = NULL;
+  if (strchr(fs_name, '/') || strchr(fs_name, '\\') || strlen(fs_name) < 5 ||
+      strcasecmp(fs_name + strlen(fs_name) - 4, ".pkg")) {
+    snprintf(result, sizeof result, "Select a single PS4 .pkg file."); goto done;
+  }
+  snprintf(dest_path, sizeof dest_path, "%s/%s", DOWNLOAD_DIR, fs_name);
+  if (!job.saved_only) {
+    url_encode(fs_name, encoded_name, sizeof encoded_name);
+    snprintf(content_path, sizeof content_path, "/api/roms/%ld/content/%s", job.rom_id, encoded_name);
+    mkdir("/data/romm-ps5", 0777);
+    mkdir(DOWNLOAD_DIR, 0777);
+    transfer_message("Downloading PKG...");
+    notify("RomM: downloading %s", fs_name);
+    printf("[download] GET %s -> %s\n", content_path, dest_path);
+    if (romm_download_to_file(&job.cfg, job.auth, content_path, dest_path)) {
+      snprintf(result, sizeof result, "Download failed. Check the terminal for HTTP status and byte counts.");
+      goto done;
+    }
+    printf("[download] complete: %s\n", dest_path);
+  } else {
+    printf("[install] using saved PKG: %s (no download)\n", dest_path);
+  }
+  transfer_message("Checking saved PKG...");
+  if (inspect_pkg(dest_path, content_id)) {
+    snprintf(result, sizeof result, "Saved PKG is missing or failed header/size validation. Check the terminal.");
+    goto done;
+  }
+  memset(&metainfo, 0, sizeof metainfo);
+  metainfo.uri = dest_path;
+  metainfo.ex_uri = "";
+  metainfo.playgo_scenario_id = "";
+  metainfo.content_id = content_id;
+  metainfo.content_name = fs_name;
+  metainfo.icon_url = "";
+  transfer_message("Requesting installation...");
+  printf("[install] PlayGo buffer=%zu bytes, uri=%s content_id=%s\n",
+         sizeof playgoinfo, dest_path, content_id);
+  if (!installer_initialized) {
+    err = sceAppInstUtilInitialize();
+    printf("[install] sceAppInstUtilInitialize -> 0x%x\n", err);
+    if (err) {
+      snprintf(result, sizeof result, "Installer initialization failed (0x%x). PKG retained.", err);
+      goto done;
+    }
+    installer_initialized = 1;
+  }
+  err = sceAppInstUtilInstallByPackage(&metainfo, &pkginfo, &playgoinfo);
+  printf("[install] sceAppInstUtilInstallByPackage -> 0x%x\n", err);
+  printf("[install] returned content_id=%.48s type=%d platform=%d\n",
+         pkginfo.content_id, pkginfo.type, pkginfo.platform);
+  if (err) {
+    snprintf(result, sizeof result, "Installation request failed (0x%x). PKG retained; retry installation without downloading.", err);
+  } else {
+    snprintf(result, sizeof result, "Installation accepted. Check PS5 Downloads/notifications for completion. PKG retained.");
+  }
+done:
+  free(alloc);
+  printf("[job] %s\n", result);
+  notify("RomM: %s", result);
+  pthread_mutex_lock(&transfer_lock);
+  snprintf(transfer_job.message, sizeof transfer_job.message, "%s", result);
+  transfer_job.active = 0;
+  pthread_mutex_unlock(&transfer_lock);
+  return NULL;
 }
 
+static void
+serve_transfer_status(int client_fd) {
+  transfer_job_t job;
+  char html[4096], escaped[1600], actions[1024] = "";
+  int len;
+  pthread_mutex_lock(&transfer_lock);
+  job = transfer_job;
+  pthread_mutex_unlock(&transfer_lock);
+  html_escape(job.message, escaped, sizeof escaped);
+  if (!job.active && job.rom_id >= 0) {
+    snprintf(actions, sizeof actions,
+      "<a href=\"/install-saved?id=%ld&platform_id=%ld&offset=%d\">Retry install from saved PKG</a>"
+      "<a href=\"/retry-download?id=%ld&platform_id=%ld&offset=%d\">Download again</a>",
+      job.rom_id, job.platform_id, job.offset, job.rom_id, job.platform_id, job.offset);
+  }
+  len = snprintf(html, sizeof html,
+    "<!doctype html><html><head><meta charset=\"utf-8\">%s<title>RomM transfer</title>"
+    "<style>body{background:#111;color:#eee;font-family:sans-serif;font-size:2.2vw}"
+    "a{color:#8cf;display:block;padding:1.5vw}a:focus{background:#345}</style></head><body>"
+    "<h1>RomM transfer</h1><p>%s</p><p>%llu / %llu bytes (%.1f%%)</p>"
+    "<p>%s</p>%s<a href=\"/status\">Refresh status</a>"
+    "<a href=\"/rom?id=%ld&platform_id=%ld&offset=%d\">Back to game</a></body></html>",
+    job.active ? "<meta http-equiv=\"refresh\" content=\"3;url=/status\">" : "",
+    escaped, job.received, job.expected,
+    job.expected ? 100.0 * (double)job.received / (double)job.expected : 0.0,
+    job.active ? "Work continues if you leave this page. No need to click Download again." : "",
+    actions, job.rom_id, job.platform_id, job.offset);
+  send_html_page(client_fd, html, (size_t)len);
+  close(client_fd);
+}
 
 static void
 serve_download(int client_fd, const config_t *cfg, const char *auth_b64,
-               long rom_id, long platform_id, int offset) {
-  long ps4_id;
-  char api_path[64];
-  char *alloc = NULL;
-  char *body;
-  const char *p;
-  char fs_name[256];
-  char fs_name_esc[512];
-  char html[2048];
-  size_t html_len;
-
-  ps4_id = lookup_platform_id(cfg, auth_b64, "ps4");
-  if (ps4_id < 0 || platform_id != ps4_id) {
-    serve_unsupported_platform(client_fd, rom_id, platform_id, offset);
+               long rom_id, long platform_id, int offset, int saved_only, int retry) {
+  pthread_t worker;
+  pthread_attr_t attr;
+  int err;
+  pthread_mutex_lock(&transfer_lock);
+  /* Repeated original download URLs return the current result, even when done. */
+  if (transfer_job.active || (!retry && transfer_job.rom_id == rom_id)) {
+    pthread_mutex_unlock(&transfer_lock);
+    serve_transfer_status(client_fd);
     return;
   }
-
-  snprintf(api_path, sizeof api_path, "/api/roms/%ld", rom_id);
-  body = romm_get(cfg, auth_b64, api_path, &alloc);
-  if (body == NULL) {
-    serve_error_page(client_fd, "Could not reach RomM server.",
-                      rom_id, platform_id, offset);
-    return;
+  memset(&transfer_job, 0, sizeof transfer_job);
+  transfer_job.cfg = *cfg;
+  snprintf(transfer_job.auth, sizeof transfer_job.auth, "%s", auth_b64);
+  transfer_job.rom_id = rom_id;
+  transfer_job.platform_id = platform_id;
+  transfer_job.offset = offset;
+  transfer_job.saved_only = saved_only;
+  transfer_job.active = 1;
+  snprintf(transfer_job.message, sizeof transfer_job.message, "Preparing transfer...");
+  err = pthread_attr_init(&attr);
+  if (!err) {
+    err = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (!err) err = pthread_create(&worker, &attr, run_transfer, NULL);
+    pthread_attr_destroy(&attr);
   }
-
-  p = strstr(body, "\"fs_name\":\"");
-  if (p != NULL) {
-    copy_json_string(p + strlen("\"fs_name\":\""), fs_name, sizeof fs_name);
-  } else {
-    fs_name[0] = '\0';
+  if (err) {
+    transfer_job.active = 0;
+    snprintf(transfer_job.message, sizeof transfer_job.message, "Could not start worker: %d", err);
   }
-  free(alloc);
-
-  if (fs_name[0] == '\0') {
-    serve_error_page(client_fd, "Could not determine the rom's file name.",
-                      rom_id, platform_id, offset);
-    return;
-  }
-
-  if (strchr(fs_name, '/') || strchr(fs_name, '\\') ||
-      strlen(fs_name) < 5 || strcasecmp(fs_name + strlen(fs_name) - 4, ".pkg")) {
-    serve_error_page(client_fd, "Select a single PS4 .pkg file, not a folder or archive.",
-                    rom_id, platform_id, offset);
-    return;
-  }
-
-  html_escape(fs_name, fs_name_esc, sizeof fs_name_esc);
-
+  pthread_mutex_unlock(&transfer_lock);
+  /* Redirect to a read-only status URL, so refresh never repeats a download. */
   {
-    char encoded_name[768];
-    char content_path[800];
-    char dest_path[600];
-    int rc;
-
-    url_encode(fs_name, encoded_name, sizeof encoded_name);
-    snprintf(content_path, sizeof content_path,
-             "/api/roms/%ld/content/%s", rom_id, encoded_name);
-
-    mkdir("/data/romm-ps5", 0777);
-    mkdir(DOWNLOAD_DIR, 0777);
-    snprintf(dest_path, sizeof dest_path, "%s/%s", DOWNLOAD_DIR, fs_name);
-
-    notify("RomM: downloading %s ...", fs_name);
-    printf("[download] GET %s -> %s\n", content_path, dest_path);
-    fflush(stdout);
-    rc = romm_download_to_file(cfg, auth_b64, content_path, dest_path);
-    if (rc != 0) {
-      notify("RomM: download failed for %s", fs_name);
-      printf("[download] FAILED for %s\n", dest_path);
-      fflush(stdout);
-      serve_error_page(client_fd, "Download failed.",
-                        rom_id, platform_id, offset);
-      return;
-    }
-    printf("[download] complete: %s\n", dest_path);
-    fflush(stdout);
-
-    notify("RomM: download complete, installing %s ...", fs_name);
-
-    {
-      pkg_metadata_t metainfo;
-      pkg_info_t pkginfo;
-      playgo_info_t playgoinfo;
-      int err;
-      int i;
-
-      memset(&metainfo, 0, sizeof metainfo);
-      memset(&pkginfo, 0, sizeof pkginfo);
-      memset(&playgoinfo, 0, sizeof playgoinfo);
-
-      metainfo.uri = dest_path;
-      metainfo.ex_uri = "";
-      metainfo.playgo_scenario_id = "";
-      metainfo.content_id = "";
-      metainfo.icon_url = "";
-      metainfo.content_name = dest_path;
-      for (i = 0; dest_path[i] != '\0'; i++) {
-        if (dest_path[i] == '/') {
-          metainfo.content_name = dest_path + i + 1;
-        }
-      }
-
-      printf("[install] uri=%s content_name=%s\n",
-             metainfo.uri, metainfo.content_name);
-      fflush(stdout);
-
-      err = sceAppInstUtilInitialize();
-      printf("[install] sceAppInstUtilInitialize -> 0x%x\n", err);
-      fflush(stdout);
-      if (err != 0) {
-        notify("RomM: sceAppInstUtilInitialize failed: 0x%x", err);
-      } else {
-        err = sceAppInstUtilInstallByPackage(&metainfo, &pkginfo,
-                                              &playgoinfo);
-        printf("[install] sceAppInstUtilInstallByPackage -> 0x%x\n", err);
-        fflush(stdout);
-        if (err == 0) {
-          notify("RomM: install started for %s", fs_name);
-        } else {
-          notify("RomM: install failed: 0x%x", err);
-        }
-      }
-      if (err != 0) {
-        char message[160];
-        snprintf(message, sizeof message,
-                 "PKG downloaded, but installation failed (0x%x). The file is retained.", err);
-        serve_error_page(client_fd, message, rom_id, platform_id, offset);
-        return;
-      }
-    }
+    const char response[] = "HTTP/1.1 303 See Other\r\nLocation: /status\r\n"
+                            "Cache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    send_all(client_fd, response, sizeof response - 1);
   }
-
-  html_len = snprintf(html, sizeof html,
-    "<!doctype html><html><head><meta charset=\"utf-8\">"
-    "<title>RomM</title>"
-    "<style>body{background:#111;color:#eee;font-family:sans-serif;"
-    "font-size:2.2vw}"
-    "a{color:#8cf;display:block;padding:1.5vw;text-decoration:none}"
-    "a:focus,a:hover{background:#8cf;color:#111}</style></head><body>"
-    "<h1>%s</h1>"
-    "<p>Downloaded and install triggered. Check the PS5 notifications "
-    "for the result.</p>"
-    "<a href=\"/rom?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">"
-    "&laquo; Back</a></body></html>", fs_name_esc, rom_id, platform_id,
-    offset);
-  send_html_page(client_fd, html, html_len);
   close(client_fd);
 }
 
@@ -1128,6 +1185,7 @@ main() {
   int optval = 1;
 
   setvbuf(stdout, NULL, _IONBF, 0);
+  signal(SIGPIPE, SIG_IGN);
 
   if (load_config(&cfg) != 0 || cfg.host[0] == '\0') {
     return 1;
@@ -1201,9 +1259,13 @@ main() {
     if (strcmp(path, "/rom") == 0 && rom_id >= 0) {
       serve_rom_details(client_fd, &cfg, auth_b64, rom_id, platform_id,
                          (int)offset);
-    } else if (strcmp(path, "/download") == 0 && rom_id >= 0) {
+    } else if (strcmp(path, "/status") == 0) {
+      serve_transfer_status(client_fd);
+    } else if ((strcmp(path, "/download") == 0 || strcmp(path, "/install-saved") == 0 ||
+                strcmp(path, "/retry-download") == 0) && rom_id >= 0) {
       serve_download(client_fd, &cfg, auth_b64, rom_id, platform_id,
-                      (int)offset);
+                     (int)offset, strcmp(path, "/install-saved") == 0,
+                     strcmp(path, "/download") != 0);
     } else if (platform_id < 0) {
       serve_picker(client_fd, &cfg, auth_b64);
     } else {
