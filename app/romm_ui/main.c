@@ -32,6 +32,7 @@ along with this program; see the file COPYING. If not, see
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <dlfcn.h>
 #ifdef __FreeBSD__
 #include <sys/sysctl.h>
 #endif
@@ -80,6 +81,7 @@ _Static_assert(sizeof(playgo_info_t) == 9984, "PlayGo ABI size");
 int sceAppInstUtilInitialize(void);
 int sceAppInstUtilInstallByPackage(const pkg_metadata_t*, pkg_info_t*,
                                     playgo_info_t*);
+typedef int (*app_install_pkg_fn)(const char*, pkg_info_t*);
 
 #define SHELLCORE_AUTHID 0x3800000000000010ULL
 #define SYSTEM_INSTALL_AUTHID 0x4801000000000013ULL
@@ -1180,9 +1182,25 @@ run_transfer(void *unused) {
     }
     installer_initialized = 1;
   }
-  err = sceAppInstUtilInstallByPackage(&metainfo, &pkginfo, &playgoinfo);
+  {
+    app_install_pkg_fn install_local =
+      (app_install_pkg_fn)dlsym(RTLD_DEFAULT, "sceAppInstUtilAppInstallPkg");
+    if (install_local) {
+      printf("[install] trying sceAppInstUtilAppInstallPkg for local PKG\n");
+      err = install_local(dest_path, &pkginfo);
+      printf("[install] sceAppInstUtilAppInstallPkg -> 0x%x\n", err);
+    } else {
+      printf("[install] sceAppInstUtilAppInstallPkg is not exported; using fallback\n");
+      err = -1;
+    }
+    if (err) {
+      memset(&pkginfo, 0, sizeof pkginfo);
+      printf("[install] falling back to sceAppInstUtilInstallByPackage\n");
+      err = sceAppInstUtilInstallByPackage(&metainfo, &pkginfo, &playgoinfo);
+      printf("[install] sceAppInstUtilInstallByPackage -> 0x%x\n", err);
+    }
+  }
   installer_auth_release(saved_authid);
-  printf("[install] sceAppInstUtilInstallByPackage -> 0x%x\n", err);
   printf("[install] returned content_id=%.48s type=%d platform=%d\n",
          pkginfo.content_id, pkginfo.type, pkginfo.platform);
   if (err) {
