@@ -25,7 +25,7 @@ endif
 
 ELF := romm_ui.elf
 
-CFLAGS := -Wall -Werror -g
+CFLAGS := -O2 -Wall -Werror -g
 CFLAGS += -lpthread
 CFLAGS += -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ZLIB_APIS -DMINIZ_NO_TIME
 MINIZ_SRC := vendor/miniz/miniz.c vendor/miniz/miniz_tinfl.c miniz_reader.c

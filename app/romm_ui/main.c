@@ -337,7 +337,9 @@ romm_download_to_file(const config_t *cfg, const char *auth_b64,
   struct timeval timeout = {60, 0};
   int len;
   ssize_t n;
-  time_t last_progress = 0;
+  char *write_buffer = NULL;
+  time_t last_progress = 0, started = 0;
+  unsigned long long last_received = 0;
 
   len = snprintf(part, sizeof part, "%s.part", dest_path);
   if (len < 0 || (size_t)len >= sizeof part) return -1;
@@ -413,6 +415,10 @@ romm_download_to_file(const config_t *cfg, const char *auth_b64,
   fflush(stdout);
   fp = fopen(part, "wb");
   if (!fp) { failure = "cannot open temporary download file"; goto done; }
+  /* Heap buffer coalesces short reads without growing the worker stack. */
+  write_buffer = malloc(256 * 1024);
+  if (write_buffer) (void)setvbuf(fp, write_buffer, _IOFBF, 256 * 1024);
+  started = last_progress = time(NULL);
   transfer_progress(0, expected);
   part_created = 1;
   while (received < expected) {
@@ -426,10 +432,15 @@ romm_download_to_file(const config_t *cfg, const char *auth_b64,
     }
     received += (unsigned long long)n;
     transfer_progress(received, expected);
-    if (time(NULL) - last_progress >= 5 || received == expected) {
-      printf("[download] progress=%llu/%llu bytes (%.1f%%)\n",
-             received, expected, 100.0 * (double)received / (double)expected);
-      last_progress = time(NULL);
+    time_t now = time(NULL);
+    if (now - last_progress >= 5 || received == expected) {
+      double seconds = difftime(now, last_progress);
+      printf("[download] progress=%llu/%llu bytes (%.1f%%) speed=%.2f MB/s elapsed=%.0fs\n",
+             received, expected, 100.0 * (double)received / (double)expected,
+             seconds > 0 ? (double)(received - last_received) / seconds / 1000000.0 : 0.0,
+             difftime(now, started));
+      last_received = received;
+      last_progress = now;
     }
   }
   if (fclose(fp)) {
@@ -442,6 +453,7 @@ romm_download_to_file(const config_t *cfg, const char *auth_b64,
   ok = 1;
 done:
   if (fp) fclose(fp);
+  free(write_buffer);
   if (sock >= 0) close(sock);
   if (!ok) {
     /* Only remove a temporary file created by this attempt. */

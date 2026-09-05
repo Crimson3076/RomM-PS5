@@ -83,6 +83,8 @@ typedef struct {
   FILE *fp;
   uint64_t file_written, total_written, expected;
   time_t last_log;
+  uint64_t last_written;
+  mz_uint entries_done, entries_total;
 } ps5_extract_sink;
 
 static size_t
@@ -92,10 +94,14 @@ ps5_zip_write(void *opaque, mz_uint64 offset, const void *data, size_t size) {
   sink->file_written += size;
   sink->total_written += size;
   transfer_progress(sink->total_written, sink->expected);
-  if (time(NULL) - sink->last_log >= 5) {
-    printf("[ps5] extracted=%llu/%llu bytes\n", (unsigned long long)sink->total_written,
-           (unsigned long long)sink->expected);
-    sink->last_log = time(NULL);
+  time_t now = time(NULL);
+  if (now - sink->last_log >= 5) {
+    printf("[ps5] extracted=%llu/%llu bytes entries=%u/%u speed=%.2f MB/s\n",
+           (unsigned long long)sink->total_written, (unsigned long long)sink->expected,
+           sink->entries_done, sink->entries_total,
+           (double)(sink->total_written - sink->last_written) / difftime(now, sink->last_log) / 1000000.0);
+    sink->last_written = sink->total_written;
+    sink->last_log = now;
   }
   return size;
 }
@@ -112,6 +118,7 @@ ps5_prepare(const char *source, const char *name, long rom_id, char *result, siz
   uint64_t expanded = 0;
   mz_uint count = 0, roots = 0, images = 0;
   int opened = 0, ok = 0;
+  char *write_buffer = NULL;
   const char *ext = ps5_image_ext(name);
   snprintf(result, result_size, "Could not prepare PS5 files. Source retained; see terminal.");
   if (rom_id < 0 || lstat(source, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0) goto done;
@@ -207,13 +214,18 @@ ps5_prepare(const char *source, const char *name, long rom_id, char *result, siz
   snprintf(stage, sizeof stage, "%s/romm-%ld-XXXXXX", PS5_STAGE_DIR, rom_id);
   if (!mkdtemp(stage)) { stage[0] = 0; goto done; }
   transfer_message("Extracting PS5 archive...");
-  ps5_extract_sink sink = {.expected = expanded};
+  ps5_extract_sink sink = {.expected = expanded, .last_log = time(NULL), .entries_total = count};
+  /* The staging directory is private and ZIP symlinks are rejected. Reuse
+     the last verified parent for adjacent files instead of walking it again. */
+  char last_parent[1200] = "";
+  write_buffer = malloc(256 * 1024);
   for (mz_uint i = 0; i < count; i++) {
     char entry[768], dest[1200], parent[1200];
     mz_zip_archive_file_stat info;
     if (ps5_zip_name(&zip, i, entry) || !mz_zip_reader_file_stat(&zip, i, &info)) goto done;
     int n = snprintf(dest, sizeof dest, "%s/%s", stage, entry);
     if (n < 0 || (size_t)n >= sizeof dest) goto done;
+    sink.entries_done = i;
     if (info.m_is_directory) {
       size_t len = strlen(dest);
       if (dest[len - 1] == '/') dest[len - 1] = 0;
@@ -221,11 +233,15 @@ ps5_prepare(const char *source, const char *name, long rom_id, char *result, siz
       continue;
     }
     strcpy(parent, dest); *strrchr(parent, '/') = 0;
-    if (ps5_mkdirs(parent)) goto done;
+    if (strcmp(parent, last_parent)) {
+      if (ps5_mkdirs(parent)) goto done;
+      strcpy(last_parent, parent);
+    }
     int fd = open(dest, O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0) goto done;
     sink.fp = fdopen(fd, "wb");
     if (!sink.fp) { close(fd); goto done; }
+    if (write_buffer) (void)setvbuf(sink.fp, write_buffer, _IOFBF, 256 * 1024);
     sink.file_written = 0;
     int extracted = mz_zip_reader_extract_to_callback(&zip, i, ps5_zip_write, &sink, 0);
     int flushed = fclose(sink.fp);
@@ -248,6 +264,7 @@ published:
   snprintf(result, result_size, "PS5 files ready at %.120s. ShadowMountPlus must scan them; launch compatibility is not verified.", final);
   goto done;
 done:
+  free(write_buffer);
   if (opened) mz_zip_reader_end(&zip);
   if (stage[0]) ps5_remove_stage(stage);
   if (!ok) printf("[ps5] %s\n", result);
