@@ -28,6 +28,10 @@ ELF := romm_ui.elf
 CFLAGS := -O2 -Wall -Werror -g
 CFLAGS += -lpthread
 CFLAGS += -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ZLIB_APIS -DMINIZ_NO_TIME
+# make PS5_EXTRACT_PROFILE=1 logs where extraction time goes; off by default.
+ifdef PS5_EXTRACT_PROFILE
+    CFLAGS += -DPS5_EXTRACT_PROFILE=1
+endif
 MINIZ_SRC := vendor/miniz/miniz.c vendor/miniz/miniz_tinfl.c miniz_reader.c
 
 all: $(ELF)

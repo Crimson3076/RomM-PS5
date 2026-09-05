@@ -10,6 +10,44 @@
 #define PS5_STAGE_DIR "/data/romm-ps5/staging"
 #endif
 
+/* Build with -DPS5_EXTRACT_PROFILE=1 to log where extraction time goes.
+ * Off by default: zero overhead, no behavior change. Callback timings
+ * (fwrite/progress) happen inside the extract-call timing, not beside it,
+ * so extract_call minus (fwrite+progress) is archive read+decompress+CRC. */
+#ifndef PS5_EXTRACT_PROFILE
+#define PS5_EXTRACT_PROFILE 0
+#endif
+
+#if PS5_EXTRACT_PROFILE
+#include <time.h>
+
+typedef struct {
+  double total_s, mkdirs_open_s, extract_call_s, fwrite_s, progress_s, fclose_s;
+  uint64_t files, dirs, callbacks;
+} ps5_extract_profile;
+
+static double
+ps5_prof_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static void
+ps5_prof_report(const ps5_extract_profile *p) {
+  double callback_s = p->fwrite_s + p->progress_s;
+  double decompress_s = p->extract_call_s - callback_s;
+  printf("[ps5][profile] total=%.3fs mkdirs+open=%.3fs extract_call=%.3fs "
+         "(fwrite=%.3fs progress=%.3fs decompress_est=%.3fs) fclose=%.3fs "
+         "unaccounted=%.3fs files=%llu dirs=%llu callbacks=%llu\n",
+         p->total_s, p->mkdirs_open_s, p->extract_call_s, p->fwrite_s, p->progress_s,
+         decompress_s < 0 ? 0.0 : decompress_s, p->fclose_s,
+         p->total_s - p->mkdirs_open_s - p->extract_call_s - p->fclose_s,
+         (unsigned long long)p->files, (unsigned long long)p->dirs,
+         (unsigned long long)p->callbacks);
+}
+#endif
+
 static int
 ps5_suffix(const char *name, const char *suffix) {
   size_t a = strlen(name), b = strlen(suffix);
@@ -85,12 +123,25 @@ typedef struct {
   time_t last_log;
   uint64_t last_written;
   mz_uint entries_done, entries_total;
+#if PS5_EXTRACT_PROFILE
+  ps5_extract_profile *prof;
+#endif
 } ps5_extract_sink;
 
 static size_t
 ps5_zip_write(void *opaque, mz_uint64 offset, const void *data, size_t size) {
   ps5_extract_sink *sink = opaque;
-  if (offset != sink->file_written || fwrite(data, 1, size, sink->fp) != size) return 0;
+#if PS5_EXTRACT_PROFILE
+  sink->prof->callbacks++;
+  double t0 = ps5_prof_now(), t1;
+#endif
+  if (offset != sink->file_written) return 0;
+  size_t written = fwrite(data, 1, size, sink->fp);
+#if PS5_EXTRACT_PROFILE
+  t1 = ps5_prof_now();
+  sink->prof->fwrite_s += t1 - t0;
+#endif
+  if (written != size) return 0;
   sink->file_written += size;
   sink->total_written += size;
   transfer_progress(sink->total_written, sink->expected);
@@ -103,6 +154,9 @@ ps5_zip_write(void *opaque, mz_uint64 offset, const void *data, size_t size) {
     sink->last_written = sink->total_written;
     sink->last_log = now;
   }
+#if PS5_EXTRACT_PROFILE
+  sink->prof->progress_s += ps5_prof_now() - t1;
+#endif
   return size;
 }
 
@@ -219,6 +273,11 @@ ps5_prepare(const char *source, const char *name, long rom_id, char *result, siz
      the last verified parent for adjacent files instead of walking it again. */
   char last_parent[1200] = "";
   write_buffer = malloc(256 * 1024);
+#if PS5_EXTRACT_PROFILE
+  ps5_extract_profile prof = {0};
+  sink.prof = &prof;
+  double prof_total_start = ps5_prof_now(), t;
+#endif
   for (mz_uint i = 0; i < count; i++) {
     char entry[768], dest[1200], parent[1200];
     mz_zip_archive_file_stat info;
@@ -229,28 +288,57 @@ ps5_prepare(const char *source, const char *name, long rom_id, char *result, siz
     if (info.m_is_directory) {
       size_t len = strlen(dest);
       if (dest[len - 1] == '/') dest[len - 1] = 0;
-      if (ps5_mkdirs(dest)) goto done;
+#if PS5_EXTRACT_PROFILE
+      t = ps5_prof_now();
+#endif
+      int failed = ps5_mkdirs(dest);
+#if PS5_EXTRACT_PROFILE
+      prof.mkdirs_open_s += ps5_prof_now() - t;
+      prof.dirs++;
+#endif
+      if (failed) goto done;
       continue;
     }
     strcpy(parent, dest); *strrchr(parent, '/') = 0;
+#if PS5_EXTRACT_PROFILE
+    t = ps5_prof_now();
+#endif
     if (strcmp(parent, last_parent)) {
       if (ps5_mkdirs(parent)) goto done;
       strcpy(last_parent, parent);
     }
     int fd = open(dest, O_WRONLY | O_CREAT | O_EXCL, 0644);
+#if PS5_EXTRACT_PROFILE
+    prof.mkdirs_open_s += ps5_prof_now() - t;
+    prof.files++;
+#endif
     if (fd < 0) goto done;
     sink.fp = fdopen(fd, "wb");
     if (!sink.fp) { close(fd); goto done; }
     if (write_buffer) (void)setvbuf(sink.fp, write_buffer, _IOFBF, 256 * 1024);
     sink.file_written = 0;
+#if PS5_EXTRACT_PROFILE
+    t = ps5_prof_now();
+#endif
     int extracted = mz_zip_reader_extract_to_callback(&zip, i, ps5_zip_write, &sink, 0);
+#if PS5_EXTRACT_PROFILE
+    prof.extract_call_s += ps5_prof_now() - t;
+    t = ps5_prof_now();
+#endif
     int flushed = fclose(sink.fp);
+#if PS5_EXTRACT_PROFILE
+    prof.fclose_s += ps5_prof_now() - t;
+#endif
     sink.fp = NULL;
     if (!extracted || flushed || sink.file_written != info.m_uncomp_size) {
       printf("[ps5] extraction failed entry=%s error=%s\n", entry, mz_zip_get_error_string(mz_zip_get_last_error(&zip)));
       goto done;
     }
   }
+#if PS5_EXTRACT_PROFILE
+  prof.total_s = ps5_prof_now() - prof_total_start;
+  ps5_prof_report(&prof);
+#endif
   char selected[1200];
   int n = snprintf(selected, sizeof selected, "%s/%s", stage, roots ? root : image_name);
   if (n < 0 || (size_t)n >= sizeof selected) goto done;
