@@ -49,7 +49,7 @@ Before running it, copy `app/romm_client/config.example.txt` to `app/romm_client
 
 ## On-Screen UI
 
-`app/romm_ui` is the first on-screen browsing milestone. It reads the same `/data/romm-ps5/config.txt` and runs a tiny local HTTP server on the console at `127.0.0.1:8081`. `sceSystemServiceLaunchWebBrowser` was tried for auto-launching the PS5's system browser, but it appears to only work reliably from installed PKG apps, not raw elfldr payloads -- so instead the payload shows a PS5 notification with the URL, and you open the system Browser app yourself (installing the community `internetbrowser-ps5.pkg` first, if Debug Settings -> Web errors out) and navigate to it. The landing page looks up the PS4 and PS5 platform IDs from `GET /api/platforms` (by matching `slug`) and offers a choice between them; picking one lists that platform's ROMs from `GET /api/roms?platform_ids=...`, with Prev/Next links for pagination. Clicking a game opens a details page (name, platform, file size, from `GET /api/roms/{id}`) with a Download link. For PS4 titles (stored on RomM as `.pkg` files), Download streams the file from `GET /api/roms/{id}/content/{file_name}` straight to `/data/romm-ps5/downloads/` on the console (no in-memory buffering, since these can be multi-gigabyte), then triggers installation via the native `sceAppInstUtilInstallByPackage` API (struct layouts and usage taken from [ps5-payload-dev/shsrv](https://github.com/ps5-payload-dev/shsrv)'s own package installer, not etaHEN's DPI, since etaHEN itself is being retired in favor of a bare `elfldr`+`kstuff` setup). PS5 titles are stored on RomM as `.zip` archives of ShadowMountPlus-ready folder dumps; extracting those on-console would require implementing DEFLATE decompression from scratch (no linkable userland zlib exists in this SDK), so that's deferred as a separate, harder milestone -- picking a PS5 title currently shows an honest "not implemented for this platform yet" page instead. DualSense navigation (D-pad/X/Circle) comes from the system browser's own built-in controller-to-page input mapping -- no JavaScript gamepad API is used.
+`app/romm_ui` reads `/data/romm-ps5/config.txt` and serves the console browser at `http://127.0.0.1:8081/`. It lists RomM platforms and games. PS4 single-file `.pkg` downloads are saved in `/data/romm-ps5/downloads/`. The game page offers **Download only**, **Download and install with etaHEN**, **Install saved PKG with etaHEN**, and read-only package inspection. PS5 archive installation is not implemented.
 
 Build and deploy it the same way as `romm_client`:
 
@@ -104,28 +104,33 @@ python3 -m unittest discover -s tests -v
 Console validation still requires building with the PS5 payload SDK and testing
 against a real RomM server and PS5.
 
-### Installer retry revision
+### etaHEN installation
 
-The PlayGo output buffer now matches the 9,984-byte layout in the
-[etaHEN package installation writeup](https://github.com/etaHEN/etaHEN/blob/main/PS5%20technical%20writeups/pkg-writeup.md).
-The previous 6,976-byte buffer was undersized. Compile-time assertions check
-its size and field offsets. The package-info argument remains a zeroed output
-structure; an empty value in the native log alone does not diagnose a failure.
-The package content ID is read from the header and supplied as input metadata.
-The exact cause of console error `0x80b2116f` remains unconfirmed pending retest.
+Enable **DPI v2** in etaHEN before requesting installation. RomM sends an
+HTTP form POST to `127.0.0.1:12800/upload`, with the saved console path in `url`
+and the filename in `content_name`. This matches
+[etaHEN's DPI implementation](https://github.com/etaHEN/etaHEN/blob/main/Source%20Code/util/source/DirectPKGInstaller.cpp).
+No RomM credentials or PKG bytes are sent to that endpoint. RomM no longer
+calls Sony's installer directly, changes installer credentials, or serves `/pkg`.
 
-On a game page, **Install saved PKG (no download)** reuses the existing file in
-`/data/romm-ps5/downloads/`. It never requests the content endpoint. It requires
-RomM metadata access to identify the saved filename. A preflight checks PS4 CNT
-magic, a printable content ID, and file size against the big-endian package-size
-field documented by [LibOrbisPkg](https://github.com/maxton/LibOrbisPkg/blob/master/LibOrbisPkg/PKG/PkgReader.cs).
-This does not verify signatures or every package entry. A failed preflight
-retains the file and does not call the installer.
+**Download only** saves and checks the file without contacting etaHEN.
+**Install saved PKG with etaHEN** reuses the saved file without downloading it;
+it still needs RomM metadata access to identify the filename. Preflight checks
+PS4 CNT magic, content ID and declared file size. **Inspect saved PKG** adds
+bounded PlayGo structural checks. Neither inspection authenticates the package.
 
-Download and installation work runs in one background worker. `/status` displays
-byte counts and refreshes every three seconds while active. Progress also prints
-to stdout about every five seconds during transfer. Repeated original Download
-URLs return the active/latest result for that ROM rather than restarting it;
-explicit retry actions are provided. Closing or refreshing the browser does not
-cancel a job. Installation accepted means the native request returned success,
-not that asynchronous installation has completed; check PS5 notifications.
+A `SUCCESS:` response means etaHEN accepted the request, not that installation
+finished. Check PS5 notifications for completion. `FAILED:` responses preserve
+etaHEN's error in the log. Missing DPI produces an enable-DPI message. A lost,
+truncated, timed-out or unrecognized response is **unconfirmed**, because the
+installation may already have started. Check etaHEN before retrying. RomM does
+not retry or fall back to the old installer automatically. Saved files are retained.
+
+One background worker handles transfers and submissions with a 512 KiB stack.
+`/status` remains responsive and refreshes while the worker is active. Repeated
+original download URLs return the latest result for that ROM and action;
+explicit retry actions are provided. Closing the browser does not cancel a job.
+
+Host tests cover the DPI wire protocol, escaped paths, acceptance versus failure,
+missing services, incomplete replies, and download-only isolation. Console testing
+is still required to verify the etaHEN handoff on the user's firmware.

@@ -21,8 +21,6 @@ class Install(unittest.TestCase):
 #include "app/romm_ui/main.c"
 #undef main
 int sceKernelSendNotificationRequest(int a, notify_request_t*b, size_t c, int d) { return 0; }
-int sceAppInstUtilInitialize(void) { return 0; }
-int sceAppInstUtilInstallByPackage(const pkg_metadata_t*a, pkg_info_t*b, playgo_info_t*c) { return 0; }
 int main(int argc, char **argv) {
   char id[49];
   if (!strcmp(argv[1], "inspect")) return inspect_pkg(argv[2], id) ? 1 : 0;

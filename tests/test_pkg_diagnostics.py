@@ -22,8 +22,6 @@ class Diagnostics(unittest.TestCase):
 #include "app/romm_ui/main.c"
 #undef main
 int sceKernelSendNotificationRequest(int a, notify_request_t*b, size_t c, int d) { return 0; }
-int sceAppInstUtilInitialize(void) { abort(); }
-int sceAppInstUtilInstallByPackage(const pkg_metadata_t*a, pkg_info_t*b, playgo_info_t*c) { abort(); }
 int main(int argc, char **argv) {
   if (!strcmp(argv[1], "job")) {
     strcpy(transfer_job.cfg.host, "127.0.0.1");

@@ -45,6 +45,7 @@ along with this program; see the file COPYING. If not, see
 #define DOWNLOAD_DIR "/data/romm-ps5/downloads"
 #endif
 #define INSPECT_SAVED 2
+#define DOWNLOAD_ONLY 3
 #include "pkg_diagnostics.h"
 
 typedef struct notify_request {
@@ -53,121 +54,6 @@ typedef struct notify_request {
 } notify_request_t;
 
 int sceKernelSendNotificationRequest(int, notify_request_t*, size_t, int);
-
-typedef struct pkg_metadata {
-  const char *uri;
-  const char *ex_uri;
-  const char *playgo_scenario_id;
-  const char *content_id;
-  const char *content_name;
-  const char *icon_url;
-} pkg_metadata_t;
-
-typedef struct pkg_info {
-  char content_id[48];
-  int type;
-  int platform;
-} pkg_info_t;
-
-typedef struct playgo_info {
-  char lang[30][8];
-  char scenario_ids[64][3];
-  char content_ids[64][48];
-  unsigned char unknown[6480];
-} playgo_info_t;
-
-/* Layout documented by etaHEN's PS5 package-installation writeup. */
-_Static_assert(offsetof(playgo_info_t, content_ids) == 432, "PlayGo content IDs offset");
-_Static_assert(offsetof(playgo_info_t, unknown) == 3504, "PlayGo reserved offset");
-_Static_assert(sizeof(playgo_info_t) == 9984, "PlayGo ABI size");
-
-int sceAppInstUtilInitialize(void);
-int sceAppInstUtilInstallByPackage(const pkg_metadata_t*, pkg_info_t*,
-                                    playgo_info_t*);
-#define SHELLCORE_AUTHID 0x3800000000000010ULL
-#define SYSTEM_INSTALL_AUTHID 0x4801000000000013ULL
-
-#ifdef __FreeBSD__
-extern uint64_t kernel_get_ucred_authid(pid_t);
-extern int kernel_set_ucred_authid(pid_t, uint64_t);
-#endif
-
-static int
-parse_firmware_major(const char *version) {
-  const char *p;
-  int major = 0;
-  if (!version) return 0;
-  p = strstr(version, "releases/");
-  if (!p) return 0;
-  p += strlen("releases/");
-  if (*p < '0' || *p > '9') return 0;
-  while (*p >= '0' && *p <= '9') {
-    major = major * 10 + (*p - '0');
-    p++;
-  }
-  return major;
-}
-
-static int
-detect_firmware_major(void) {
-#ifdef __FreeBSD__
-  char version[256];
-  size_t size = sizeof version;
-  if (sysctlbyname("kern.version", version, &size, NULL, 0)) return 0;
-  version[sizeof version - 1] = '\0';
-  return parse_firmware_major(version);
-#else
-  return parse_firmware_major(NULL);
-#endif
-}
-
-/* Sony's installer establishes credential-sensitive IPC state during
-   Initialize. Keep both Initialize and InstallByPackage inside one authid
-   window. FW 10+ requires SYSTEM; older supported firmware uses ShellCore. */
-static int
-installer_auth_acquire(uint64_t *saved_authid, uint64_t *target_authid,
-                       int *firmware_major) {
-  *firmware_major = detect_firmware_major();
-  *target_authid = *firmware_major >= 10 ?
-    SYSTEM_INSTALL_AUTHID : SHELLCORE_AUTHID;
-#ifdef __FreeBSD__
-  *saved_authid = kernel_get_ucred_authid(getpid());
-  if (!*saved_authid) {
-    printf("[install] cannot read current authid; is kstuff-lite loaded?\n");
-    return -1;
-  }
-  if (kernel_set_ucred_authid(getpid(), *target_authid) ||
-      kernel_get_ucred_authid(getpid()) != *target_authid) {
-    printf("[install] authid swap failed: current=0x%llx target=0x%llx\n",
-           (unsigned long long)*saved_authid,
-           (unsigned long long)*target_authid);
-    return -1;
-  }
-#else
-  *saved_authid = 0;
-#endif
-  printf("[install] firmware_major=%d authid_before=0x%llx authid_target=0x%llx (%s)\n",
-         *firmware_major, (unsigned long long)*saved_authid,
-         (unsigned long long)*target_authid,
-         *target_authid == SYSTEM_INSTALL_AUTHID ? "SYSTEM" : "ShellCore");
-  return 0;
-}
-
-static void
-installer_auth_release(uint64_t saved_authid) {
-#ifdef __FreeBSD__
-  int attempt;
-  if (!saved_authid) return;
-  for (attempt = 0; attempt < 3; attempt++) {
-    (void)kernel_set_ucred_authid(getpid(), saved_authid);
-    if (kernel_get_ucred_authid(getpid()) == saved_authid) return;
-  }
-  printf("[install] WARNING: could not restore authid=0x%llx\n",
-         (unsigned long long)saved_authid);
-#else
-  (void)saved_authid;
-#endif
-}
 
 typedef struct {
   char host[128];
@@ -188,10 +74,6 @@ typedef struct {
 
 static transfer_job_t transfer_job = {.rom_id = -1};
 static pthread_mutex_t transfer_lock = PTHREAD_MUTEX_INITIALIZER;
-/* The installer reaches this file through the loopback HTTP endpoint. Only
-   one transfer job exists, so one pinned path is sufficient. */
-static char installer_pkg_path[600];
-
 static void
 transfer_message(const char *message) {
   pthread_mutex_lock(&transfer_lock);
@@ -438,6 +320,8 @@ url_encode(const char *in, char *out, size_t out_size) {
   out[oi < out_size ? oi : out_size - 1] = '\0';
 }
 
+
+#include "etahen_client.h"
 
 /* Require a framed, complete response before exposing a file to the installer.
    HTTP/1.0 requests avoid chunked transfer encoding; reject it if sent anyway. */
@@ -948,110 +832,6 @@ serve_page(int client_fd, const config_t *cfg, const char *auth_b64,
 
 
 
-static const char *
-header_value(const char *headers, const char *name) {
-  size_t name_len = strlen(name);
-  const char *line = headers;
-  while (line && *line) {
-    const char *end = strstr(line, "\r\n");
-    size_t len = end ? (size_t)(end - line) : strlen(line);
-    if (len > name_len && !strncasecmp(line, name, name_len) &&
-        line[name_len] == ':') {
-      line += name_len + 1;
-      while (*line == ' ' || *line == '\t') line++;
-      return line;
-    }
-    if (!end || end == line) break;
-    line = end + 2;
-  }
-  return NULL;
-}
-
-/* Serve the already verified PKG back to Sony's installer as an actual HTTP
-   source. AppInst/PlayGo on some firmware rejects a bare local path even
-   though it accepts a loopback URL. Byte ranges are required by PlayGo. */
-static void
-serve_installer_pkg(int client_fd, const char *headers, int head_only) {
-  char path[sizeof installer_pkg_path];
-  char response[512], buf[65536];
-  const char *range;
-  struct stat st;
-  FILE *fp;
-  unsigned long long size, start = 0, end, remaining;
-  int partial = 0, response_len;
-
-  snprintf(path, sizeof path, "%s", installer_pkg_path);
-  if (!path[0] || stat(path, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0) {
-    const char not_found[] =
-      "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    send_all(client_fd, not_found, sizeof not_found - 1);
-    close(client_fd);
-    return;
-  }
-  size = (unsigned long long)st.st_size;
-  end = size - 1;
-  range = header_value(headers, "Range");
-  if (range && !strncasecmp(range, "bytes=", 6)) {
-    char *tail;
-    errno = 0;
-    start = strtoull(range + 6, &tail, 10);
-    if (errno || tail == range + 6 || *tail != '-' || start >= size) {
-      response_len = snprintf(response, sizeof response,
-        "HTTP/1.1 416 Range Not Satisfiable\r\n"
-        "Content-Range: bytes */%llu\r\nContent-Length: 0\r\n"
-        "Connection: close\r\n\r\n", size);
-      send_all(client_fd, response, (size_t)response_len);
-      close(client_fd);
-      return;
-    }
-    tail++;
-    if (*tail >= '0' && *tail <= '9') {
-      unsigned long long requested_end = strtoull(tail, &tail, 10);
-      if (requested_end < start) {
-        close(client_fd);
-        return;
-      }
-      if (requested_end < end) end = requested_end;
-    }
-    partial = 1;
-  }
-  remaining = end - start + 1;
-  if (partial) {
-    response_len = snprintf(response, sizeof response,
-      "HTTP/1.1 206 Partial Content\r\n"
-      "Content-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\n"
-      "Content-Range: bytes %llu-%llu/%llu\r\nContent-Length: %llu\r\n"
-      "Connection: close\r\n\r\n", start, end, size, remaining);
-  } else {
-    response_len = snprintf(response, sizeof response,
-      "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
-      "Accept-Ranges: bytes\r\nContent-Length: %llu\r\n"
-      "Connection: close\r\n\r\n", size);
-  }
-  send_all(client_fd, response, (size_t)response_len);
-  if (head_only) {
-    close(client_fd);
-    return;
-  }
-  fp = fopen(path, "rb");
-  if (!fp || fseeko(fp, (off_t)start, SEEK_SET)) {
-    if (fp) fclose(fp);
-    close(client_fd);
-    return;
-  }
-  printf("[pkg-http] %s bytes=%llu-%llu/%llu\n",
-         partial ? "range" : "full", start, end, size);
-  while (remaining) {
-    size_t want = remaining > sizeof buf ? sizeof buf : (size_t)remaining;
-    size_t got = fread(buf, 1, want, fp);
-    if (!got) break;
-    send_all(client_fd, buf, got);
-    remaining -= got;
-  }
-  fclose(fp);
-  close(client_fd);
-}
-
 static void
 send_html_page(int client_fd, const char *html, size_t html_len) {
   char header[256];
@@ -1156,12 +936,14 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
     "<h1>%s</h1>"
     "<p>Platform: %s</p>"
     "<p>Size: %s</p>"
-    "<a href=\"/download?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Download</a>"
-    "<a href=\"/install-saved?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Install saved PKG (no download)</a>"
+    "<a href=\"/download?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Download and install with etaHEN</a>"
+    "<a href=\"/download-only?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Download only</a>"
+    "<a href=\"/install-saved?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Install saved PKG with etaHEN</a>"
     "<a href=\"/inspect-saved?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Inspect saved PKG (no install)</a>"
     "<a href=\"/?platform_id=%ld&offset=%d\" tabindex=\"0\">&laquo; Back to list</a>"
     "</body></html>",
     fs_name_esc, platform_esc, size_str,
+    rom_id, platform_id, offset,
     rom_id, platform_id, offset,
     rom_id, platform_id, offset,
     rom_id, platform_id, offset,
@@ -1217,12 +999,6 @@ run_transfer(void *unused) {
   char dest_path[600], content_id[49], result[256];
   char *alloc = NULL, *body;
   const char *p;
-  pkg_metadata_t metainfo;
-  pkg_info_t pkginfo = {0};
-  playgo_info_t playgoinfo = {0};
-  static int installer_initialized = 0; /* one worker at a time */
-  int err, firmware_major;
-  uint64_t saved_authid, target_authid;
   (void)unused;
   pthread_mutex_lock(&transfer_lock);
   job = transfer_job;
@@ -1243,7 +1019,7 @@ run_transfer(void *unused) {
     snprintf(result, sizeof result, "Select a single PS4 .pkg file."); goto done;
   }
   snprintf(dest_path, sizeof dest_path, "%s/%s", DOWNLOAD_DIR, fs_name);
-  if (!job.saved_only) {
+  if (!job.saved_only || job.saved_only == DOWNLOAD_ONLY) {
     url_encode(fs_name, encoded_name, sizeof encoded_name);
     snprintf(content_path, sizeof content_path, "/api/roms/%ld/content/%s", job.rom_id, encoded_name);
     mkdir("/data/romm-ps5", 0777);
@@ -1271,49 +1047,13 @@ run_transfer(void *unused) {
       "Inspection complete. See terminal diagnostics. No installation requested.");
     goto done;
   }
-  memset(&metainfo, 0, sizeof metainfo);
-  metainfo.uri = dest_path;
-  metainfo.ex_uri = "";
-  metainfo.playgo_scenario_id = "";
-  /* Match etaHEN and ps5upload DPI: leave optional metadata strings empty.
-     The parsed content ID is returned separately in pkginfo. */
-  metainfo.content_id = "";
-  metainfo.content_name = fs_name;
-  metainfo.icon_url = "";
-  transfer_message("Requesting installation...");
-  printf("[install] PlayGo buffer=%zu bytes, uri=%s header_content_id=%s\n",
-         sizeof playgoinfo, dest_path, content_id);
-  if (installer_auth_acquire(&saved_authid, &target_authid,
-                             &firmware_major)) {
-    snprintf(result, sizeof result,
-             "Installer privilege setup failed. Confirm kstuff-lite is loaded, then reboot before retrying.");
+  if (job.saved_only == DOWNLOAD_ONLY) {
+    snprintf(result, sizeof result, "Download complete. PKG saved. No installation requested.");
     goto done;
   }
-  if (!installer_initialized) {
-    err = sceAppInstUtilInitialize();
-    printf("[install] sceAppInstUtilInitialize -> 0x%x\n", err);
-    if (err) {
-      installer_auth_release(saved_authid);
-      snprintf(result, sizeof result, "Installer initialization failed (0x%x). PKG retained.", err);
-      goto done;
-    }
-    installer_initialized = 1;
-  }
-  snprintf(installer_pkg_path, sizeof installer_pkg_path, "%s", dest_path);
-  metainfo.uri = "http://127.0.0.1:" UI_PORT "/pkg";
-  printf("[install] submitting loopback URI=%s\n", metainfo.uri);
-  printf("[install] args: metadata=%zu pkg_info=%zu playgo=%zu optional_strings=empty\n",
-         sizeof metainfo, sizeof pkginfo, sizeof playgoinfo);
-  err = sceAppInstUtilInstallByPackage(&metainfo, &pkginfo, &playgoinfo);
-  printf("[install] sceAppInstUtilInstallByPackage(loopback) -> 0x%x\n", err);
-  installer_auth_release(saved_authid);
-  printf("[install] returned content_id=%.48s type=%d platform=%d\n",
-         pkginfo.content_id, pkginfo.type, pkginfo.platform);
-  if (err) {
-    snprintf(result, sizeof result, "Installation request failed (0x%x). PKG retained; retry installation without downloading.", err);
-  } else {
-    snprintf(result, sizeof result, "Installation accepted. Check PS5 Downloads/notifications for completion. PKG retained.");
-  }
+  transfer_message("Sending saved PKG to etaHEN...");
+  etahen_install(dest_path, fs_name, result, sizeof result);
+
 done:
   free(alloc);
   printf("[job] %s\n", result);
@@ -1336,8 +1076,8 @@ serve_transfer_status(int client_fd) {
   html_escape(job.message, escaped, sizeof escaped);
   if (!job.active && job.rom_id >= 0) {
     snprintf(actions, sizeof actions,
-      "<a href=\"/install-saved?id=%ld&platform_id=%ld&offset=%d\">Retry install from saved PKG</a>"
-      "<a href=\"/retry-download?id=%ld&platform_id=%ld&offset=%d\">Download again</a>",
+      "<a href=\"/install-saved?id=%ld&platform_id=%ld&offset=%d\">Install saved PKG with etaHEN</a>"
+      "<a href=\"/retry-download?id=%ld&platform_id=%ld&offset=%d\">Download and install again</a>",
       job.rom_id, job.platform_id, job.offset, job.rom_id, job.platform_id, job.offset);
   }
   len = snprintf(html, sizeof html,
@@ -1364,7 +1104,7 @@ serve_download(int client_fd, const config_t *cfg, const char *auth_b64,
   int err;
   pthread_mutex_lock(&transfer_lock);
   /* Repeated original download URLs return the current result, even when done. */
-  if (transfer_job.active || (!retry && transfer_job.rom_id == rom_id)) {
+  if (transfer_job.active || (!retry && transfer_job.rom_id == rom_id && transfer_job.saved_only == saved_only)) {
     pthread_mutex_unlock(&transfer_lock);
     serve_transfer_status(client_fd);
     return;
@@ -1448,9 +1188,7 @@ main() {
     char req[REQ_BUF_SIZE];
     ssize_t n;
     char *line_end;
-    const char *headers = "";
     char path[32];
-    int head_only = 0;
     long platform_id;
     long offset;
     long rom_id;
@@ -1476,13 +1214,11 @@ main() {
     line_end = strstr(req, "\r\n");
     if (line_end != NULL) {
       *line_end = '\0';
-      headers = line_end + 2;
     }
 
     path[0] = '\0';
     if (strncmp(req, "GET ", 4) == 0 || strncmp(req, "HEAD ", 5) == 0) {
       const char *p = req + (req[0] == 'H' ? 5 : 4);
-      head_only = req[0] == 'H';
       size_t i = 0;
       while (*p != '\0' && *p != ' ' && *p != '?' && i + 1 < sizeof path) {
         path[i++] = *p++;
@@ -1494,20 +1230,19 @@ main() {
     offset = parse_query_long(req, "offset", 0);
     rom_id = parse_query_long(req, "id", -1);
 
-    if (strcmp(path, "/pkg") == 0) {
-      serve_installer_pkg(client_fd, headers, head_only);
-    } else if (strcmp(path, "/rom") == 0 && rom_id >= 0) {
+    if (strcmp(path, "/rom") == 0 && rom_id >= 0) {
       serve_rom_details(client_fd, &cfg, auth_b64, rom_id, platform_id,
                          (int)offset);
     } else if (strcmp(path, "/status") == 0) {
       serve_transfer_status(client_fd);
     } else if ((strcmp(path, "/download") == 0 || strcmp(path, "/install-saved") == 0 ||
-                strcmp(path, "/inspect-saved") == 0 ||
+                strcmp(path, "/inspect-saved") == 0 || strcmp(path, "/download-only") == 0 ||
                 strcmp(path, "/retry-download") == 0) && rom_id >= 0) {
       serve_download(client_fd, &cfg, auth_b64, rom_id, platform_id,
-                     (int)offset, strcmp(path, "/inspect-saved") == 0 ? INSPECT_SAVED :
+                     (int)offset, strcmp(path, "/download-only") == 0 ? DOWNLOAD_ONLY :
+                     strcmp(path, "/inspect-saved") == 0 ? INSPECT_SAVED :
                      strcmp(path, "/install-saved") == 0,
-                     strcmp(path, "/download") != 0);
+                     strcmp(path, "/download") != 0 && strcmp(path, "/download-only") != 0);
     } else if (platform_id < 0) {
       serve_picker(client_fd, &cfg, auth_b64);
     } else {

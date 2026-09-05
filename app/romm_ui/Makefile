@@ -26,11 +26,11 @@ endif
 ELF := romm_ui.elf
 
 CFLAGS := -Wall -Werror -g
-CFLAGS += -lSceIpmi -lSceAppInstUtil -lpthread
+CFLAGS += -lpthread
 
 all: $(ELF)
 
-$(ELF): main.c pkg_diagnostics.h
+$(ELF): main.c pkg_diagnostics.h etahen_client.h
 	$(CC) $(CFLAGS) -o $@ main.c
 
 clean:

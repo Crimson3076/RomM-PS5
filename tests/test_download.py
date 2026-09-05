@@ -20,8 +20,6 @@ class Downloads(unittest.TestCase):
 #include "app/romm_ui/main.c"
 #undef main
 int sceKernelSendNotificationRequest(int a, notify_request_t*b, size_t c, int d) { return 0; }
-int sceAppInstUtilInitialize(void) { return 0; }
-int sceAppInstUtilInstallByPackage(const pkg_metadata_t*a, pkg_info_t*b, playgo_info_t*c) { return 0; }
 int main(int argc, char **argv) {
   config_t cfg = {0};
   strcpy(cfg.host, "127.0.0.1");
