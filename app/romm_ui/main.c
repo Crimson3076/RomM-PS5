@@ -41,7 +41,11 @@ along with this program; see the file COPYING. If not, see
 #define ROMS_PER_PAGE 20
 #define RECV_BUF_SIZE 65536
 #define REQ_BUF_SIZE 2048
+#ifndef DOWNLOAD_DIR
 #define DOWNLOAD_DIR "/data/romm-ps5/downloads"
+#endif
+#define INSPECT_SAVED 2
+#include "pkg_diagnostics.h"
 
 typedef struct notify_request {
   char useless1[45];
@@ -1154,9 +1158,11 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
     "<p>Size: %s</p>"
     "<a href=\"/download?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Download</a>"
     "<a href=\"/install-saved?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Install saved PKG (no download)</a>"
+    "<a href=\"/inspect-saved?id=%ld&platform_id=%ld&offset=%d\" tabindex=\"0\">Inspect saved PKG (no install)</a>"
     "<a href=\"/?platform_id=%ld&offset=%d\" tabindex=\"0\">&laquo; Back to list</a>"
     "</body></html>",
     fs_name_esc, platform_esc, size_str,
+    rom_id, platform_id, offset,
     rom_id, platform_id, offset,
     rom_id, platform_id, offset,
     platform_id, offset);
@@ -1250,7 +1256,7 @@ run_transfer(void *unused) {
       goto done;
     }
     printf("[download] complete: %s\n", dest_path);
-  } else {
+  } else if (job.saved_only != INSPECT_SAVED) {
     printf("[install] using saved PKG: %s (no download)\n", dest_path);
   }
   transfer_message("Checking saved PKG...");
@@ -1258,13 +1264,19 @@ run_transfer(void *unused) {
     snprintf(result, sizeof result, "Saved PKG is missing or failed header/size validation. Check the terminal.");
     goto done;
   }
+  if (job.saved_only == INSPECT_SAVED) {
+    int warnings = diagnose_pkg(dest_path, content_id);
+    snprintf(result, sizeof result,
+      warnings < 0 ? "Inspection could not read the saved PKG. No installation requested." :
+      "Inspection complete. See terminal diagnostics. No installation requested.");
+    goto done;
+  }
   memset(&metainfo, 0, sizeof metainfo);
   metainfo.uri = dest_path;
   metainfo.ex_uri = "";
   metainfo.playgo_scenario_id = "";
-  /* content_id in metadata is input-only for remote URL flows. For a
-     staged local PKG, Sony reads it from the header and returns it in
-     pkginfo. Seeding this field can cause a parser rejection. */
+  /* Match etaHEN and ps5upload DPI: leave optional metadata strings empty.
+     The parsed content ID is returned separately in pkginfo. */
   metainfo.content_id = "";
   metainfo.content_name = fs_name;
   metainfo.icon_url = "";
@@ -1290,6 +1302,8 @@ run_transfer(void *unused) {
   snprintf(installer_pkg_path, sizeof installer_pkg_path, "%s", dest_path);
   metainfo.uri = "http://127.0.0.1:" UI_PORT "/pkg";
   printf("[install] submitting loopback URI=%s\n", metainfo.uri);
+  printf("[install] args: metadata=%zu pkg_info=%zu playgo=%zu optional_strings=empty\n",
+         sizeof metainfo, sizeof pkginfo, sizeof playgoinfo);
   err = sceAppInstUtilInstallByPackage(&metainfo, &pkginfo, &playgoinfo);
   printf("[install] sceAppInstUtilInstallByPackage(loopback) -> 0x%x\n", err);
   installer_auth_release(saved_authid);
@@ -1488,9 +1502,11 @@ main() {
     } else if (strcmp(path, "/status") == 0) {
       serve_transfer_status(client_fd);
     } else if ((strcmp(path, "/download") == 0 || strcmp(path, "/install-saved") == 0 ||
+                strcmp(path, "/inspect-saved") == 0 ||
                 strcmp(path, "/retry-download") == 0) && rom_id >= 0) {
       serve_download(client_fd, &cfg, auth_b64, rom_id, platform_id,
-                     (int)offset, strcmp(path, "/install-saved") == 0,
+                     (int)offset, strcmp(path, "/inspect-saved") == 0 ? INSPECT_SAVED :
+                     strcmp(path, "/install-saved") == 0,
                      strcmp(path, "/download") != 0);
     } else if (platform_id < 0) {
       serve_picker(client_fd, &cfg, auth_b64);

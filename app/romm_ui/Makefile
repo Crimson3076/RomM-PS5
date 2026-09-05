@@ -30,8 +30,8 @@ CFLAGS += -lSceIpmi -lSceAppInstUtil -lpthread
 
 all: $(ELF)
 
-$(ELF): main.c
-	$(CC) $(CFLAGS) -o $@ $^
+$(ELF): main.c pkg_diagnostics.h
+	$(CC) $(CFLAGS) -o $@ main.c
 
 clean:
 	rm -f $(ELF)
