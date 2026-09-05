@@ -287,13 +287,127 @@ html_escape(const char *in, char *out, size_t out_size) {
 }
 
 
-static int
-parse_offset(const char *request_line) {
-  const char *q = strstr(request_line, "offset=");
+static long
+parse_query_long(const char *request_line, const char *key, long fallback) {
+  char needle[32];
+  const char *q;
+
+  snprintf(needle, sizeof needle, "%s=", key);
+  q = strstr(request_line, needle);
   if (q == NULL) {
-    return 0;
+    return fallback;
   }
-  return atoi(q + strlen("offset="));
+  return strtol(q + strlen(needle), NULL, 10);
+}
+
+
+/* Find the innermost '{' enclosing the byte at pos, by scanning backward
+   and tracking brace depth. */
+static const char *
+find_object_start(const char *body, const char *pos) {
+  const char *p = pos;
+  int depth = 0;
+
+  while (p > body) {
+    p--;
+    if (*p == '}') {
+      depth++;
+    } else if (*p == '{') {
+      if (depth == 0) {
+        return p;
+      }
+      depth--;
+    }
+  }
+  return NULL;
+}
+
+
+/* Given a pointer to the '{' that opens an object, find the matching '}'. */
+static const char *
+find_object_end(const char *obj_start) {
+  const char *p = obj_start;
+  int depth = 0;
+
+  while (*p != '\0') {
+    if (*p == '{') {
+      depth++;
+    } else if (*p == '}') {
+      depth--;
+      if (depth == 0) {
+        return p;
+      }
+    }
+    p++;
+  }
+  return NULL;
+}
+
+
+/* Bounded substring search: like strstr, but never reads past end. */
+static const char *
+find_in_range(const char *start, const char *end, const char *key) {
+  size_t key_len = strlen(key);
+  const char *p;
+
+  if (key_len == 0 || end < start || (size_t)(end - start) < key_len) {
+    return NULL;
+  }
+
+  for (p = start; p <= end - key_len; p++) {
+    if (memcmp(p, key, key_len) == 0) {
+      return p;
+    }
+  }
+  return NULL;
+}
+
+
+static long
+find_int_field_in_range(const char *start, const char *end, const char *key) {
+  const char *p = find_in_range(start, end, key);
+  if (p == NULL) {
+    return -1;
+  }
+  return strtol(p + strlen(key), NULL, 10);
+}
+
+
+/* Look up the numeric platform_id whose platform_slug matches slug, by
+   scanning /api/platforms. Returns -1 if not found or on error. */
+static long
+lookup_platform_id(const config_t *cfg, const char *auth_b64,
+                    const char *slug) {
+  char *alloc = NULL;
+  char *body;
+  char needle[64];
+  const char *match;
+  const char *obj_start;
+  const char *obj_end;
+  long id;
+
+  body = romm_get(cfg, auth_b64, "/api/platforms", &alloc);
+  if (body == NULL) {
+    return -1;
+  }
+
+  snprintf(needle, sizeof needle, "\"slug\":\"%s\"", slug);
+  match = strstr(body, needle);
+  if (match == NULL) {
+    free(alloc);
+    return -1;
+  }
+
+  obj_start = find_object_start(body, match);
+  obj_end = obj_start != NULL ? find_object_end(obj_start) : NULL;
+  if (obj_start == NULL || obj_end == NULL) {
+    free(alloc);
+    return -1;
+  }
+
+  id = find_int_field_in_range(obj_start, obj_end, "\"id\":");
+  free(alloc);
+  return id;
 }
 
 
@@ -312,9 +426,60 @@ send_all(int fd, const char *buf, size_t len) {
 
 
 static void
+serve_picker(int client_fd, const config_t *cfg, const char *auth_b64) {
+  long ps4_id;
+  long ps5_id;
+  char html[4096];
+  size_t html_len;
+  char header[256];
+  int header_len;
+
+  ps4_id = lookup_platform_id(cfg, auth_b64, "ps4");
+  ps5_id = lookup_platform_id(cfg, auth_b64, "ps5");
+
+  html_len = snprintf(html, sizeof html,
+    "<!doctype html><html><head><meta charset=\"utf-8\">"
+    "<title>RomM</title>"
+    "<style>"
+    "body{background:#111;color:#eee;font-family:sans-serif;font-size:3vw}"
+    "a{color:#8cf;display:block;padding:2vw;text-decoration:none}"
+    "a:focus,a:hover{background:#8cf;color:#111}"
+    "</style></head><body>"
+    "<h1>Select Platform</h1>");
+
+  if (ps4_id >= 0) {
+    html_len += snprintf(html + html_len, sizeof html - html_len,
+      "<a href=\"/?platform_id=%ld&offset=0\" tabindex=\"0\">PlayStation 4</a>",
+      ps4_id);
+  }
+  if (ps5_id >= 0) {
+    html_len += snprintf(html + html_len, sizeof html - html_len,
+      "<a href=\"/?platform_id=%ld&offset=0\" tabindex=\"0\">PlayStation 5</a>",
+      ps5_id);
+  }
+  if (ps4_id < 0 && ps5_id < 0) {
+    html_len += snprintf(html + html_len, sizeof html - html_len,
+      "<p>No PS4 or PS5 platform found on this RomM server.</p>");
+  }
+  html_len += snprintf(html + html_len, sizeof html - html_len,
+    "</body></html>");
+
+  header_len = snprintf(header, sizeof header,
+                         "HTTP/1.1 200 OK\r\n"
+                         "Content-Type: text/html; charset=utf-8\r\n"
+                         "Content-Length: %zu\r\n"
+                         "Connection: close\r\n"
+                         "\r\n", html_len);
+  send_all(client_fd, header, (size_t)header_len);
+  send_all(client_fd, html, html_len);
+  close(client_fd);
+}
+
+
+static void
 serve_page(int client_fd, const config_t *cfg, const char *auth_b64,
-           int offset) {
-  char api_path[128];
+           long platform_id, int offset) {
+  char api_path[160];
   char *alloc = NULL;
   char *body;
   const char *cursor;
@@ -337,8 +502,9 @@ serve_page(int client_fd, const config_t *cfg, const char *auth_b64,
 #define APPEND(...) \
   html_len += snprintf(html + html_len, html_cap - html_len, __VA_ARGS__)
 
-  snprintf(api_path, sizeof api_path, "/api/roms?limit=%d&offset=%d",
-           ROMS_PER_PAGE, offset);
+  snprintf(api_path, sizeof api_path,
+           "/api/roms?limit=%d&offset=%d&platform_id=%ld",
+           ROMS_PER_PAGE, offset, platform_id);
   body = romm_get(cfg, auth_b64, api_path, &alloc);
 
   APPEND("<!doctype html><html><head><meta charset=\"utf-8\">"
@@ -349,7 +515,8 @@ serve_page(int client_fd, const config_t *cfg, const char *auth_b64,
          "a:focus,a:hover{background:#8cf;color:#111}"
          "nav{margin-top:2vw}nav a{display:inline-block}"
          "</style></head><body>"
-         "<h1>RomM Library</h1><ul>");
+         "<h1>RomM Library</h1>"
+         "<p><a href=\"/\" tabindex=\"0\">&laquo; Change platform</a></p><ul>");
 
   if (body == NULL) {
     APPEND("<li>Could not reach RomM server.</li>");
@@ -394,11 +561,12 @@ serve_page(int client_fd, const config_t *cfg, const char *auth_b64,
     if (prev < 0) {
       prev = 0;
     }
-    APPEND("<a href=\"/?offset=%d\" tabindex=\"0\">&laquo; Prev</a> ", prev);
+    APPEND("<a href=\"/?platform_id=%ld&offset=%d\" tabindex=\"0\">&laquo; Prev</a> ",
+           platform_id, prev);
   }
   if (offset + ROMS_PER_PAGE < total) {
-    APPEND("<a href=\"/?offset=%d\" tabindex=\"0\">Next &raquo;</a>",
-           offset + ROMS_PER_PAGE);
+    APPEND("<a href=\"/?platform_id=%ld&offset=%d\" tabindex=\"0\">Next &raquo;</a>",
+           platform_id, offset + ROMS_PER_PAGE);
   }
   APPEND("</nav></body></html>");
 
@@ -468,7 +636,8 @@ main() {
     char req[REQ_BUF_SIZE];
     ssize_t n;
     char *line_end;
-    int offset;
+    long platform_id;
+    long offset;
 
     if (client_fd < 0) {
       continue;
@@ -485,9 +654,14 @@ main() {
     if (line_end != NULL) {
       *line_end = '\0';
     }
-    offset = parse_offset(req);
+    platform_id = parse_query_long(req, "platform_id", -1);
+    offset = parse_query_long(req, "offset", 0);
 
-    serve_page(client_fd, &cfg, auth_b64, offset);
+    if (platform_id < 0) {
+      serve_picker(client_fd, &cfg, auth_b64);
+    } else {
+      serve_page(client_fd, &cfg, auth_b64, platform_id, (int)offset);
+    }
   }
 
   sceUserServiceTerminate();

@@ -49,7 +49,7 @@ Before running it, copy `app/romm_client/config.example.txt` to `app/romm_client
 
 ## On-Screen UI
 
-`app/romm_ui` is the first on-screen browsing milestone. It reads the same `/data/romm-ps5/config.txt`, runs a tiny local HTTP server on the console at `127.0.0.1:8081`, and launches the PS5's system web browser (via `sceSystemServiceLaunchWebBrowser`, using only public SDK stub libraries) pointed at it. Each page renders a plain HTML list of ROM filenames and platforms fetched from `GET /api/roms`, with Prev/Next links for pagination. DualSense navigation (D-pad/X/Circle) comes from the system browser's own built-in controller-to-page input mapping -- no JavaScript gamepad API is used.
+`app/romm_ui` is the first on-screen browsing milestone. It reads the same `/data/romm-ps5/config.txt`, runs a tiny local HTTP server on the console at `127.0.0.1:8081`, and launches the PS5's system web browser (via `sceSystemServiceLaunchWebBrowser`, using only public SDK stub libraries) pointed at it. The landing page looks up the PS4 and PS5 platform IDs from `GET /api/platforms` (by matching `platform_slug`) and offers a choice between them; picking one lists that platform's ROMs from `GET /api/roms?platform_id=...`, with Prev/Next links for pagination. DualSense navigation (D-pad/X/Circle) comes from the system browser's own built-in controller-to-page input mapping -- no JavaScript gamepad API is used.
 
 Build and deploy it the same way as `romm_client`:
 
