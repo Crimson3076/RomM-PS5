@@ -683,6 +683,34 @@ find_string_field_in_range(const char *start, const char *end,
 }
 
 
+/* Like find_string_field_in_range, but only matches "key" as an immediate
+   field of the object spanning [start,end] (end pointing at its closing
+   '}'), never one nested inside a sub-object or array -- e.g. a rom's own
+   "name" versus platform.name or genres[].name. Skips over string
+   contents (both keys and values) so braces or quotes inside them can't
+   confuse the depth count. */
+static int
+find_top_level_string_field(const char *start, const char *end,
+                             const char *key, char *out, size_t out_size) {
+  unsigned depth = 0;
+  size_t klen = strlen(key);
+  for (const char *p = start; p < end; p++) {
+    if (*p == '{' || *p == '[') { depth++; continue; }
+    if (*p == '}' || *p == ']') { if (depth) depth--; continue; }
+    if (*p != '"') continue;
+    if (depth == 1 && (size_t)(end - p) > klen && !memcmp(p, key, klen)) {
+      copy_json_string(p + klen, out, out_size);
+      return 0;
+    }
+    for (p++; p < end && *p != '"'; p++) {
+      if (*p == '\\' && p + 1 < end) p++;
+    }
+  }
+  out[0] = '\0';
+  return -1;
+}
+
+
 /* Look up the numeric platform_id whose platform_slug matches slug, by
    scanning /api/platforms. Returns -1 if not found or on error. */
 static long
@@ -796,8 +824,9 @@ serve_page(int client_fd, const config_t *cfg, const char *auth_b64,
   char *body;
   const char *cursor;
   char fs_name[256];
+  char title[256];
   char platform[128];
-  char fs_name_esc[512];
+  char title_esc[512];
   char platform_esc[256];
   long rom_id;
   char *html;
@@ -860,13 +889,19 @@ serve_page(int client_fd, const config_t *cfg, const char *auth_b64,
       find_string_field_in_range(obj_start, obj_end,
                                   "\"platform_display_name\":\"",
                                   platform, sizeof platform);
+      /* "name" is RomM's cleaned-up display title; fall back to the raw
+         filename if a rom hasn't been matched to metadata yet. */
+      if (find_top_level_string_field(obj_start, obj_end, "\"name\":\"",
+                                       title, sizeof title) || !title[0]) {
+        snprintf(title, sizeof title, "%s", fs_name);
+      }
       rom_id = find_int_field_in_range(obj_start, obj_end, "\"id\":");
 
-      html_escape(fs_name, fs_name_esc, sizeof fs_name_esc);
+      html_escape(title, title_esc, sizeof title_esc);
       html_escape(platform, platform_esc, sizeof platform_esc);
       APPEND("<li><a href=\"/rom?id=%ld&platform_id=%ld&offset=%d\" "
              "tabindex=\"0\">%s <small>(%s)</small></a></li>",
-             rom_id, platform_id, offset, fs_name_esc, platform_esc);
+             rom_id, platform_id, offset, title_esc, platform_esc);
       shown++;
       cursor = obj_end + 1;
       if (html_cap - html_len < 1024) {
@@ -964,8 +999,9 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
   char *alloc = NULL;
   char *body;
   char fs_name[256];
+  char title[256];
   char platform[128];
-  char fs_name_esc[512];
+  char title_esc[512];
   char platform_esc[256];
   char size_str[32];
   long size_bytes;
@@ -1010,9 +1046,17 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
   size_bytes = (p != NULL) ?
     strtol(p + strlen("\"fs_size_bytes\":"), NULL, 10) : -1;
 
+  {
+    const char *obj_end = find_object_end(body);
+    if (!obj_end || find_top_level_string_field(body, obj_end, "\"name\":\"",
+                                                 title, sizeof title) || !title[0]) {
+      snprintf(title, sizeof title, "%s", fs_name);
+    }
+  }
+
   free(alloc);
 
-  html_escape(fs_name, fs_name_esc, sizeof fs_name_esc);
+  html_escape(title, title_esc, sizeof title_esc);
   html_escape(platform, platform_esc, sizeof platform_esc);
   format_size(size_bytes, size_str, sizeof size_str);
 
@@ -1045,7 +1089,7 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
     "<p>%s</p>%s"
     "<a href=\"/?platform_id=%ld&offset=%d\" tabindex=\"0\">&laquo; Back to list</a>"
     "</body></html>",
-    fs_name_esc, platform_esc, size_str,
+    title_esc, platform_esc, size_str,
     is_ps5 ? "RomM multi-file folders, ZIP/ZIP64 or PS5 images. Prepared to /data/homebrew for ShadowMountPlus; sources retained." : "PS4 .pkg; etaHEN DPI v2 required for installation.", actions,
     platform_id, offset);
 
