@@ -374,6 +374,13 @@ romm_download_to_file_mode(const config_t *cfg, const char *auth_b64,
     failure = "could not set network timeout";
     goto done;
   }
+  /* Best-effort: a larger receive buffer lets the kernel keep more in
+     flight before the payload calls recv() again. Not correctness-critical,
+     so a failure here is not fatal to the download. */
+  {
+    int rcvbuf = 1024 * 1024;
+    (void)setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+  }
   while (used < (size_t)len) {
     n = send(sock, request + used, (size_t)len - used, 0);
     if (n < 0 && errno == EINTR) continue;
