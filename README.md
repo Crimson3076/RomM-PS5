@@ -49,7 +49,7 @@ Before running it, copy `app/romm_client/config.example.txt` to `app/romm_client
 
 ## On-Screen UI
 
-`app/romm_ui` is the first on-screen browsing milestone. It reads the same `/data/romm-ps5/config.txt` and runs a tiny local HTTP server on the console at `127.0.0.1:8081`. `sceSystemServiceLaunchWebBrowser` was tried for auto-launching the PS5's system browser, but it appears to only work reliably from installed PKG apps, not raw elfldr payloads -- so instead the payload shows a PS5 notification with the URL, and you open the system Browser app yourself (installing the community `internetbrowser-ps5.pkg` first, if Debug Settings -> Web errors out) and navigate to it. The landing page looks up the PS4 and PS5 platform IDs from `GET /api/platforms` (by matching `slug`) and offers a choice between them; picking one lists that platform's ROMs from `GET /api/roms?platform_ids=...`, with Prev/Next links for pagination. Clicking a game opens a details page (name, platform, file size, from `GET /api/roms/{id}`) with a Download link. For PS4 titles (stored on RomM as `.pkg` files), Download streams the file from `GET /api/roms/{id}/content/{file_name}` straight to `/data/romm-ps5/downloads/` on the console (no in-memory buffering, since these can be multi-gigabyte), then triggers installation via the native `sceAppInstUtilInstallByPackage` API (struct layouts and usage taken from [ps5-payload-dev/shsrv](https://github.com/ps5-payload-dev/shsrv)'s own package installer, not etaHEN's DPI, since etaHEN itself is being retired in favor of a bare `elfldr`+`kstuff` setup). PS5 titles are stored on RomM as `.zip` archives of ShadowMountPlus-ready folder dumps; extracting those on-console would require implementing DEFLATE decompression from scratch (no linkable userland zlib exists in this SDK), so that's deferred as a separate, harder milestone -- picking a PS5 title currently shows an honest "not implemented for this platform yet" page instead. DualSense navigation (D-pad/X/Circle) comes from the system browser's own built-in controller-to-page input mapping -- no JavaScript gamepad API is used.
+`app/romm_ui` reads `/data/romm-ps5/config.txt` and serves the console browser at `http://127.0.0.1:8081/`. It lists RomM platforms and games. PS4 single-file `.pkg` downloads are saved in `/data/romm-ps5/downloads/`. The game page offers **Download only**, **Download and install with etaHEN**, **Install saved PKG with etaHEN**, and read-only package inspection. PS5 ZIP/ZIP64 archives and ShadowMountPlus images can be downloaded and prepared for scanning.
 
 Build and deploy it the same way as `romm_client`:
 
@@ -76,3 +76,119 @@ The project is currently establishing its architecture and build system. Develop
 ## License
 
 This project is licensed under the GNU General Public License v3.0. Third-party components remain subject to their respective licenses.
+
+## Download diagnostics and regression tests
+
+PS4 downloads require a single `.pkg` entry and a plain HTTP endpoint returning
+HTTP 200 with a nonzero `Content-Length`. The downloader requests HTTP/1.0 and
+identity encoding. Redirects, chunked responses, and compressed responses fail
+explicitly; HTTPS and redirect handling are not implemented.
+
+Transfers are written to `.part` files, checked against the declared byte count,
+and renamed only after successful writes and close. This checks transfer
+completeness, not package authenticity or install compatibility. A failed
+transfer preserves an existing completed file. Socket reads/writes time out
+after 60 seconds of inactivity. Downloads run in a background worker; the browser redirects immediately to a read-only status page.
+
+Capture payload stdout with `tools/deploy_payload.py`. Failure lines include
+HTTP status and received/expected bytes, without authentication headers. A
+successful download followed by an installation error retains the PKG and shows
+the installer error code in the browser.
+
+Run host-side downloader regression tests (requires a C compiler and Python):
+
+```
+python3 -m unittest discover -s tests -v
+```
+
+Console validation still requires building with the PS5 payload SDK and testing
+against a real RomM server and PS5.
+
+### etaHEN installation
+
+Enable **DPI v2** in etaHEN before requesting installation. RomM sends an
+HTTP form POST to `127.0.0.1:12800/upload`, with etaHEN's HTTP file-serving URL
+(`http://127.0.0.1:12800/data/romm-ps5/downloads/<encoded-filename>`) in `url`
+and the filename in `content_name`. This matches
+[etaHEN's DPI implementation](https://github.com/etaHEN/etaHEN/blob/main/Source%20Code/util/source/DirectPKGInstaller.cpp).
+The URI path is percent-encoded and then form-encoded; a bare filesystem path
+was rejected with `SCE_PLAYGO_ERROR_CORE_INVALID_URI_SCHEMA` on console.
+etaHEN serves the existing PKG locally; no new RomM download is needed.
+No RomM credentials or PKG bytes are sent in the POST. RomM no longer
+calls Sony's installer directly, changes installer credentials, or serves `/pkg`.
+
+**Download only** saves and checks the file without contacting etaHEN.
+**Install saved PKG with etaHEN** reuses the saved file without downloading it;
+it still needs RomM metadata access to identify the filename. Preflight checks
+PS4 CNT magic, content ID and declared file size. **Inspect saved PKG** adds
+bounded PlayGo structural checks. Neither inspection authenticates the package.
+
+A `SUCCESS:` response means etaHEN accepted the request, not that installation
+finished. Check PS5 notifications for completion. `FAILED:` responses preserve
+etaHEN's error in the log. Missing DPI produces an enable-DPI message. A lost,
+truncated, timed-out or unrecognized response is **unconfirmed**, because the
+installation may already have started. Check etaHEN before retrying. RomM does
+not retry or fall back to the old installer automatically. Saved files are retained.
+
+One background worker handles transfers and submissions with a 512 KiB stack.
+`/status` remains responsive and refreshes while the worker is active. Repeated
+original download URLs return the latest result for that ROM and action;
+explicit retry actions are provided. Closing the browser does not cancel a job.
+
+Host tests cover the DPI wire protocol, escaped paths, acceptance versus failure,
+missing services, incomplete replies, and download-only isolation. Console testing
+is still required to verify the etaHEN handoff on the user's firmware.
+
+### PS5 formats and preparation
+
+| Input | Behavior |
+| --- | --- |
+| `.zip` / ZIP64 (stored or DEFLATE) | Extract one PS5 game folder, or one supported image |
+| `.ffpkg`, `.exfat` | Publish the completed image for ShadowMountPlus |
+| `.ffpfs`, `.ffpfsc` | Publish for ShadowMountPlus; these formats are experimental upstream |
+| `.rar`, `.7z`, split/encrypted archives, PS5 retail `.pkg` | Not supported; rejected before download |
+| Loose RomM directories | Package as a single ZIP first |
+
+PS5 game pages offer **Download and prepare PS5 game**, **Download only**, and
+**Prepare saved PS5 file (no download)**. A game-folder ZIP must contain exactly
+one `sce_sys/param.json` with a sibling `eboot.bin`. Files can be at the ZIP root
+or under wrapper directories. The detected game root is placed directly at
+`/data/homebrew/romm-<RomM-ID>/`, without extra nesting. A ZIP containing a single
+supported image produces `/data/homebrew/romm-<RomM-ID>.<image-extension>`.
+Ready-made image contents are validated by the mounter, not by RomM.
+
+These locations follow the default
+[ShadowMountPlus scan paths](https://github.com/drakmor/ShadowMountPlus#scan-paths).
+ShadowMountPlus must be running with compatible patches, and custom `scanpath`
+settings must include `/data/homebrew`. RomM prepares files; it does not report
+that a PS5 game has been installed or is playable. PS5 files never go to PS4 DPI.
+
+Downloads remain in `/data/romm-ps5/downloads/`. ZIPs are extracted into a private
+folder under `/data/romm-ps5/staging/`, with free-space preflight, streaming writes,
+CRC checks, and traversal/symlink rejection. Only a fully extracted source is
+moved into the scan directory. A failed extraction cleans up its own staging
+folder and keeps the source ZIP. An existing destination is never intentionally
+replaced; game updates/merging are not implemented. An interrupted payload may
+leave an unscanned staging folder for manual cleanup. Archives are retained, so
+space is needed for both the ZIP and extracted contents. Raw images use a hard
+link within internal storage, retaining the download without duplicating bytes.
+
+ZIP64 parsing uses vendored miniz 3.1.0, pinned in `vendor/miniz/ROMM_VENDOR.md`,
+with 64-bit file offsets and callback extraction. No external unzip binary or
+system zlib is required. Archives are limited to 100,000 entries and 32 levels
+of nesting. Host tests use ZIP64 fixtures; multi-gigabyte console transfers and
+actual ShadowMountPlus discovery still require on-device testing.
+
+### RomM multi-file PS5 games
+
+PS5 entries marked `has_multiple_files` by RomM are downloaded through its
+normal content endpoint as a generated ZIP, including games stored as folders
+without a `.zip` extension. The payload saves these as
+`/data/romm-ps5/downloads/romm-<id>-folder.zip`. Use **Prepare saved PS5 file**
+to retry extraction without downloading again.
+
+Generated ZIP downloads support Content-Length, chunked, and connection-close
+framing. When RomM does not provide a total size, status shows bytes received.
+The ZIP directory must be readable before the temporary download replaces the
+saved archive; extraction still performs CRC and safe-path checks. A folder
+must contain a single game root with `eboot.bin` and `sce_sys/param.json`.
