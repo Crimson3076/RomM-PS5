@@ -311,7 +311,11 @@ ps5_prepare(const char *source, const char *name, long rom_id, char *result, siz
       if (ps5_mkdirs(parent)) goto done;
       strcpy(last_parent, parent);
     }
-    int fd = open(dest, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    /* 0644 (no execute bit) left eboot.bin unlaunchable even after the
+       directory-mode fix; ShadowMountPlus needs the executable bit set.
+       fchmod() ignores umask, so the requested mode always lands exactly. */
+    int fd = open(dest, O_WRONLY | O_CREAT | O_EXCL, 0755);
+    if (fd >= 0 && fchmod(fd, 0755)) { close(fd); fd = -1; }
 #if PS5_EXTRACT_PROFILE
     prof.mkdirs_open_s += ps5_prof_now() - t;
     prof.files++;

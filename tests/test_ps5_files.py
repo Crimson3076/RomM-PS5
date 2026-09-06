@@ -93,6 +93,10 @@ int main(int argc, char **argv) {
         game = self.root / 'games/romm-7'
         self.assertEqual((game / 'eboot.bin').read_bytes(), b'GAME_EXECUTABLE')
         self.assertEqual((game / 'assets/test.bin').read_bytes(), b'abc123' * 10000)
+        # 0644 (no execute bit) left a real console launch unable to run
+        # eboot.bin even with correct directory permissions; extracted files
+        # must carry the executable bit regardless of the process umask.
+        self.assertEqual(stat.S_IMODE((game / 'eboot.bin').stat().st_mode), 0o755)
 
     def test_root_stored_zip64(self):
         self.prepare(self.archive(compression=zipfile.ZIP_STORED, zip64=True))
