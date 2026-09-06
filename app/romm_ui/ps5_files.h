@@ -72,7 +72,12 @@ ps5_mkdirs(const char *path) {
   for (char *p = buf + 1; ; p++) {
     if (*p != '/' && *p) continue;
     char saved = *p; *p = 0;
-    if (mkdir(buf, 0755) && errno != EEXIST) return -1;
+    /* mkdir()'s mode is subject to umask; fchmod-style verification via
+       chmod() ignores it, but only for directories this call just created,
+       never a pre-existing parent it doesn't own. */
+    int created = !mkdir(buf, 0777);
+    if (!created && errno != EEXIST) return -1;
+    if (created && chmod(buf, 0777)) return -1;
     if (lstat(buf, &st) || !S_ISDIR(st.st_mode)) return -1;
     *p = saved;
     if (!saved) break;
@@ -269,8 +274,10 @@ ps5_prepare(const char *source, const char *name, long rom_id, char *result, siz
   if (!mkdtemp(stage)) { stage[0] = 0; goto done; }
   /* mkdtemp() creates the directory 0700. When the game root is the archive
      root itself (no wrapper folder), this directory is renamed straight into
-     PS5_GAME_DIR, so fix its mode or ShadowMountPlus cannot read into it. */
-  if (chmod(stage, 0755)) goto done;
+     PS5_GAME_DIR, so fix its mode or ShadowMountPlus cannot read into it.
+     0755 (execute bit only) was confirmed insufficient on-console; the
+     working reference copy used 0777 throughout, so match that exactly. */
+  if (chmod(stage, 0777)) goto done;
   transfer_message("Extracting PS5 archive...");
   ps5_extract_sink sink = {.expected = expanded, .last_log = time(NULL), .entries_total = count};
   /* The staging directory is private and ZIP symlinks are rejected. Reuse
@@ -312,10 +319,12 @@ ps5_prepare(const char *source, const char *name, long rom_id, char *result, siz
       strcpy(last_parent, parent);
     }
     /* 0644 (no execute bit) left eboot.bin unlaunchable even after the
-       directory-mode fix; ShadowMountPlus needs the executable bit set.
+       directory-mode fix. 0755 was tried next and confirmed insufficient
+       on-console too; the working reference copy was 0777 throughout, so
+       match that exactly instead of guessing at a stricter mode again.
        fchmod() ignores umask, so the requested mode always lands exactly. */
-    int fd = open(dest, O_WRONLY | O_CREAT | O_EXCL, 0755);
-    if (fd >= 0 && fchmod(fd, 0755)) { close(fd); fd = -1; }
+    int fd = open(dest, O_WRONLY | O_CREAT | O_EXCL, 0777);
+    if (fd >= 0 && fchmod(fd, 0777)) { close(fd); fd = -1; }
 #if PS5_EXTRACT_PROFILE
     prof.mkdirs_open_s += ps5_prof_now() - t;
     prof.files++;

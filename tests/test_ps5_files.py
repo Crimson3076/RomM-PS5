@@ -93,10 +93,9 @@ int main(int argc, char **argv) {
         game = self.root / 'games/romm-7'
         self.assertEqual((game / 'eboot.bin').read_bytes(), b'GAME_EXECUTABLE')
         self.assertEqual((game / 'assets/test.bin').read_bytes(), b'abc123' * 10000)
-        # 0644 (no execute bit) left a real console launch unable to run
-        # eboot.bin even with correct directory permissions; extracted files
-        # must carry the executable bit regardless of the process umask.
-        self.assertEqual(stat.S_IMODE((game / 'eboot.bin').stat().st_mode), 0o755)
+        # 0644 and 0755 both failed to launch on a real console; only 0777,
+        # matching the known-working reference copy, actually launched.
+        self.assertEqual(stat.S_IMODE((game / 'eboot.bin').stat().st_mode), 0o777)
 
     def test_root_stored_zip64(self):
         self.prepare(self.archive(compression=zipfile.ZIP_STORED, zip64=True))
@@ -105,7 +104,9 @@ int main(int argc, char **argv) {
         # Archive-root games (no wrapper folder) publish the mkdtemp() staging
         # directory itself; it must not keep mkdtemp's private 0700 mode or
         # the mounter can discover the tile but never read into it to launch.
-        self.assertEqual(stat.S_IMODE(game.stat().st_mode), 0o755)
+        # 0755 was tried and confirmed insufficient on-console; match the
+        # known-working reference copy's 0777 instead.
+        self.assertEqual(stat.S_IMODE(game.stat().st_mode), 0o777)
 
     def test_large_zip64_game_entry_count(self):
         # Match the reported ASTRO BOT entry count with small synthetic files.
