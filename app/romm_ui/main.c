@@ -772,7 +772,8 @@ serve_picker(int client_fd, const config_t *cfg, const char *auth_b64) {
       "<p>No PS4 or PS5 platform found on this RomM server.</p>");
   }
   html_len += snprintf(html + html_len, sizeof html - html_len,
-    "</body></html>");
+    "<a href=\"/shutdown\" style=\"font-size:1.6vw;opacity:.6\">Shut down "
+    "(frees the port for redeploying a new build)</a></body></html>");
 
   header_len = snprintf(header, sizeof header,
                          "HTTP/1.1 200 OK\r\n"
@@ -1276,6 +1277,42 @@ serve_transfer_status(int client_fd) {
   close(client_fd);
 }
 
+/* Set once in main() after listen() succeeds, so /shutdown can close it.
+   The elfldr loader does not stop a previously running payload before
+   starting a new one; without this, the old process keeps the listening
+   port bound and a redeploy cannot bind it again until the console reboots. */
+static int g_listen_fd = -1;
+
+static void
+serve_shutdown(int client_fd) {
+  int active;
+  char html[512];
+  int len;
+  pthread_mutex_lock(&transfer_lock);
+  active = transfer_job.active;
+  pthread_mutex_unlock(&transfer_lock);
+  if (active) {
+    len = snprintf(html, sizeof html,
+      "<!doctype html><html><body><h1>Not shutting down</h1>"
+      "<p>A transfer is active. Exiting now would abort it and leave an "
+      "orphaned staging directory. Wait for <a href=\"/status\">status</a> "
+      "to show it finished, then try again.</p></body></html>");
+    send_html_page(client_fd, html, (size_t)len);
+    close(client_fd);
+    return;
+  }
+  len = snprintf(html, sizeof html,
+    "<!doctype html><html><body><h1>Shutting down</h1>"
+    "<p>The payload is exiting. The port is now free for a new deploy.</p>"
+    "</body></html>");
+  send_html_page(client_fd, html, (size_t)len);
+  close(client_fd);
+  printf("[shutdown] requested via /shutdown; exiting cleanly\n");
+  fflush(stdout);
+  if (g_listen_fd >= 0) close(g_listen_fd);
+  exit(0);
+}
+
 static void
 serve_download(int client_fd, const config_t *cfg, const char *auth_b64,
                long rom_id, long platform_id, int offset, int saved_only, int retry) {
@@ -1360,6 +1397,7 @@ main() {
     close(listen_fd);
     return 1;
   }
+  g_listen_fd = listen_fd;
 
   notify("RomM: open the PS5 Browser and go to http://127.0.0.1:" UI_PORT "/");
 
@@ -1415,6 +1453,8 @@ main() {
                          (int)offset);
     } else if (strcmp(path, "/status") == 0) {
       serve_transfer_status(client_fd);
+    } else if (strcmp(path, "/shutdown") == 0) {
+      serve_shutdown(client_fd);
     } else if ((strcmp(path, "/download") == 0 || strcmp(path, "/install-saved") == 0 ||
                 strcmp(path, "/inspect-saved") == 0 || strcmp(path, "/download-only") == 0 ||
                 strcmp(path, "/retry-download") == 0) && rom_id >= 0) {
