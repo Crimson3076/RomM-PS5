@@ -826,8 +826,10 @@ serve_page(int client_fd, const config_t *cfg, const char *auth_b64,
   char fs_name[256];
   char title[256];
   char platform[128];
+  char cover[512];
   char title_esc[512];
   char platform_esc[256];
+  char cover_esc[1024];
   long rom_id;
   char *html;
   size_t html_cap = 65536;
@@ -895,16 +897,26 @@ serve_page(int client_fd, const config_t *cfg, const char *auth_b64,
                                        title, sizeof title) || !title[0]) {
         snprintf(title, sizeof title, "%s", fs_name);
       }
+      /* url_cover is IGDB's public CDN; the PS5 browser fetches it
+         directly, no RomM auth needed. Not every rom has a match. */
+      find_top_level_string_field(obj_start, obj_end, "\"url_cover\":\"",
+                                   cover, sizeof cover);
       rom_id = find_int_field_in_range(obj_start, obj_end, "\"id\":");
 
       html_escape(title, title_esc, sizeof title_esc);
       html_escape(platform, platform_esc, sizeof platform_esc);
+      html_escape(cover, cover_esc, sizeof cover_esc);
       APPEND("<li><a href=\"/rom?id=%ld&platform_id=%ld&offset=%d\" "
-             "tabindex=\"0\">%s <small>(%s)</small></a></li>",
-             rom_id, platform_id, offset, title_esc, platform_esc);
+             "tabindex=\"0\">", rom_id, platform_id, offset);
+      if (cover[0]) {
+        APPEND("<img src=\"%s\" alt=\"\" loading=\"lazy\" "
+               "style=\"height:6vw;vertical-align:middle;margin-right:1vw;"
+               "border-radius:.3vw\" onerror=\"this.remove()\">", cover_esc);
+      }
+      APPEND("%s <small>(%s)</small></a></li>", title_esc, platform_esc);
       shown++;
       cursor = obj_end + 1;
-      if (html_cap - html_len < 1024) {
+      if (html_cap - html_len < 2048) {
         break;
       }
     }
@@ -1001,11 +1013,13 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
   char fs_name[256];
   char title[256];
   char platform[128];
+  char cover[512];
   char title_esc[512];
   char platform_esc[256];
+  char cover_esc[1024];
   char size_str[32];
   long size_bytes;
-  char html[4096];
+  char html[6144];
   size_t html_len;
   const char *p;
 
@@ -1046,11 +1060,16 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
   size_bytes = (p != NULL) ?
     strtol(p + strlen("\"fs_size_bytes\":"), NULL, 10) : -1;
 
+  cover[0] = '\0';
   {
     const char *obj_end = find_object_end(body);
     if (!obj_end || find_top_level_string_field(body, obj_end, "\"name\":\"",
                                                  title, sizeof title) || !title[0]) {
       snprintf(title, sizeof title, "%s", fs_name);
+    }
+    if (obj_end) {
+      find_top_level_string_field(body, obj_end, "\"url_cover\":\"",
+                                   cover, sizeof cover);
     }
   }
 
@@ -1058,6 +1077,7 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
 
   html_escape(title, title_esc, sizeof title_esc);
   html_escape(platform, platform_esc, sizeof platform_esc);
+  html_escape(cover, cover_esc, sizeof cover_esc);
   format_size(size_bytes, size_str, sizeof size_str);
 
   int is_ps5 = platform_id >= 0 && lookup_platform_id(cfg, auth_b64, "ps5") == platform_id;
@@ -1075,6 +1095,13 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
       "<a href=\"/inspect-saved?id=%ld&platform_id=%ld&offset=%d\">Inspect saved PKG (no install)</a>",
       rom_id, platform_id, offset);
   }
+  char cover_img[1200] = "";
+  if (cover[0]) {
+    snprintf(cover_img, sizeof cover_img,
+      "<img src=\"%s\" alt=\"\" style=\"max-width:40vw;max-height:40vh;"
+      "border-radius:.5vw;display:block;margin-bottom:1vw\" "
+      "onerror=\"this.remove()\">", cover_esc);
+  }
   html_len = snprintf(html, sizeof html,
     "<!doctype html><html><head><meta charset=\"utf-8\">"
     "<title>RomM</title>"
@@ -1083,13 +1110,13 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
     "a{color:#8cf;display:block;padding:1.5vw;text-decoration:none}"
     "a:focus,a:hover{background:#8cf;color:#111}"
     "</style></head><body>"
-    "<h1>%s</h1>"
+    "%s<h1>%s</h1>"
     "<p>Platform: %s</p>"
     "<p>Size: %s</p>"
     "<p>%s</p>%s"
     "<a href=\"/?platform_id=%ld&offset=%d\" tabindex=\"0\">&laquo; Back to list</a>"
     "</body></html>",
-    title_esc, platform_esc, size_str,
+    cover_img, title_esc, platform_esc, size_str,
     is_ps5 ? "RomM multi-file folders, ZIP/ZIP64 or PS5 images. Prepared to /data/homebrew for ShadowMountPlus; sources retained." : "PS4 .pkg; etaHEN DPI v2 required for installation.", actions,
     platform_id, offset);
 
