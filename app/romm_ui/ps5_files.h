@@ -237,6 +237,7 @@ ps5_prepare(const char *source, const char *name, long rom_id, char *result, siz
         (len == mlen || entry[len - mlen - 1] == '/')) {
       roots++;
       memcpy(root, entry, len - mlen); root[len - mlen] = 0;
+      printf("[ps5] game root #%u: \"%s\"\n", roots, root);
     }
     if (ps5_image_ext(entry)) { images++; strcpy(image_name, entry); }
   }
