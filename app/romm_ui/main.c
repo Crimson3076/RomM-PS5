@@ -323,15 +323,33 @@ url_encode(const char *in, char *out, size_t out_size) {
 
 #include "etahen_client.h"
 
-/* Require a framed, complete response before exposing a file to the installer.
-   HTTP/1.0 requests avoid chunked transfer encoding; reject it if sent anyway. */
+/* Generated multi-file ZIPs may be close-delimited or HTTP chunked. */
+static int streamed_zip_complete(const char *path);
+
 static int
-romm_download_to_file(const config_t *cfg, const char *auth_b64,
-                       const char *path, const char *dest_path) {
+http_line(int sock, char *line, size_t capacity) {
+  size_t n = 0;
+  while (n + 1 < capacity) {
+    ssize_t got = recv(sock, line + n, 1, 0);
+    if (got < 0 && errno == EINTR) continue;
+    if (got <= 0) return -1;
+    n++;
+    if (n >= 2 && line[n-2] == '\r' && line[n-1] == '\n') {
+      line[n-2] = 0;
+      return 0;
+    }
+  }
+  return -1;
+}
+
+static int
+romm_download_to_file_mode(const config_t *cfg, const char *auth_b64,
+                       const char *path, const char *dest_path, int generated_zip) {
   char request[2048], header[16384], buf[65536], part[1024];
   size_t used = 0;
   unsigned long long expected = 0, received = 0;
-  int have_length = 0, status = 0, ok = 0, sock = -1, part_created = 0;
+  int have_length = 0, chunked = 0, status = 0, ok = 0, sock = -1, part_created = 0;
+  unsigned long long chunk_left = 0;
   FILE *fp = NULL;
   const char *failure = "connection failed";
   struct timeval timeout = {60, 0};
@@ -397,7 +415,12 @@ romm_download_to_file(const config_t *cfg, const char *auth_b64,
         expected = length;
         have_length = 1;
       } else if (!strncasecmp(line, "Transfer-Encoding:", 18)) {
-        failure = "unsupported Transfer-Encoding"; goto done;
+        char *value = line + 18;
+        while (*value == ' ' || *value == '\t') value++;
+        if (!generated_zip || chunked || strcasecmp(value, "chunked")) {
+          failure = "unsupported Transfer-Encoding"; goto done;
+        }
+        chunked = 1;
       } else if (!strncasecmp(line, "Content-Encoding:", 17)) {
         char *value = line + 17;
         while (*value == ' ' || *value == '\t') value++;
@@ -408,10 +431,12 @@ romm_download_to_file(const config_t *cfg, const char *auth_b64,
       line = end + 2;
     }
   }
-  if (!have_length || expected == 0) {
+  if ((chunked && have_length) || (have_length && expected == 0) || (!have_length && !generated_zip)) {
     failure = "missing or empty Content-Length"; goto done;
   }
-  printf("[download] HTTP %d, expected=%llu bytes\n", status, expected);
+  if (have_length) printf("[download] HTTP %d, expected=%llu bytes\n", status, expected);
+  else printf("[download] HTTP %d, streamed ZIP, total size unknown (%s)\n", status,
+              chunked ? "chunked" : "connection-close");
   fflush(stdout);
   fp = fopen(part, "wb");
   if (!fp) { failure = "cannot open temporary download file"; goto done; }
@@ -421,22 +446,59 @@ romm_download_to_file(const config_t *cfg, const char *auth_b64,
   started = last_progress = time(NULL);
   transfer_progress(0, expected);
   part_created = 1;
-  while (received < expected) {
-    size_t want = expected - received > sizeof buf ? sizeof buf :
-                  (size_t)(expected - received);
+  while (!have_length || received < expected) {
+    if (chunked && !chunk_left) {
+      char line[1024], *end;
+      if (http_line(sock, line, sizeof line) || !line[0] ||
+          !strchr("0123456789abcdefABCDEF", line[0])) {
+        failure = "invalid or truncated chunk header"; goto done;
+      }
+      errno = 0;
+      chunk_left = strtoull(line, &end, 16);
+      if (errno || (*end && *end != ';')) {
+        failure = "invalid chunk size"; goto done;
+      }
+      if (!chunk_left) {
+        size_t trailer_bytes = 0;
+        do {
+          if (http_line(sock, line, sizeof line)) {
+            failure = "truncated chunk trailers"; goto done;
+          }
+          trailer_bytes += strlen(line) + 2;
+          if (trailer_bytes > 16384) { failure = "chunk trailers too large"; goto done; }
+        } while (line[0]);
+        break;
+      }
+    }
+    unsigned long long remaining = chunked ? chunk_left : have_length ? expected - received : sizeof buf;
+    size_t want = remaining > sizeof buf ? sizeof buf : (size_t)remaining;
     n = recv(sock, buf, want, 0);
     if (n < 0 && errno == EINTR) continue;
+    if (n == 0 && !have_length && !chunked) break;
     if (n <= 0) { failure = "transfer interrupted or timed out"; goto done; }
+    if ((unsigned long long)n > UINT64_MAX - received) { failure = "transfer size overflow"; goto done; }
     if (fwrite(buf, 1, (size_t)n, fp) != (size_t)n) {
       failure = "disk write failed (check free space)"; goto done;
     }
     received += (unsigned long long)n;
+    if (chunked) {
+      chunk_left -= (unsigned long long)n;
+      if (!chunk_left) {
+        char ending[4];
+        if (http_line(sock, ending, sizeof ending) || ending[0]) {
+          failure = "invalid chunk terminator"; goto done;
+        }
+      }
+    }
     transfer_progress(received, expected);
     time_t now = time(NULL);
     if (now - last_progress >= 5 || received == expected) {
       double seconds = difftime(now, last_progress);
-      printf("[download] progress=%llu/%llu bytes (%.1f%%) speed=%.2f MB/s elapsed=%.0fs\n",
-             received, expected, 100.0 * (double)received / (double)expected,
+      char progress[128];
+      if (expected) snprintf(progress, sizeof progress, "%llu/%llu bytes (%.1f%%)",
+                            received, expected, 100.0 * (double)received / (double)expected);
+      else snprintf(progress, sizeof progress, "%llu bytes (total unknown)", received);
+      printf("[download] progress=%s speed=%.2f MB/s elapsed=%.0fs\n", progress,
              seconds > 0 ? (double)(received - last_received) / seconds / 1000000.0 : 0.0,
              difftime(now, started));
       last_received = received;
@@ -447,6 +509,9 @@ romm_download_to_file(const config_t *cfg, const char *auth_b64,
     fp = NULL; failure = "disk flush failed"; goto done;
   }
   fp = NULL;
+  if (generated_zip && streamed_zip_complete(part)) {
+    failure = "generated ZIP is incomplete or invalid"; goto done;
+  }
   if (rename(part, dest_path)) {
     failure = "cannot finalize download"; goto done;
   }
@@ -465,6 +530,12 @@ done:
   return ok ? 0 : -1;
 }
 
+
+static int
+romm_download_to_file(const config_t *cfg, const char *auth,
+                      const char *path, const char *dest) {
+  return romm_download_to_file_mode(cfg, auth, path, dest, 0);
+}
 
 /* Copy a JSON string value starting right after its opening quote,
    unescaping \" and \\, until the closing quote or end of string. */
@@ -967,7 +1038,7 @@ serve_rom_details(int client_fd, const config_t *cfg, const char *auth_b64,
     "<a href=\"/?platform_id=%ld&offset=%d\" tabindex=\"0\">&laquo; Back to list</a>"
     "</body></html>",
     fs_name_esc, platform_esc, size_str,
-    is_ps5 ? "ZIP/ZIP64 or PS5 images. Prepared to /data/homebrew for ShadowMountPlus; sources retained." : "PS4 .pkg; etaHEN DPI v2 required for installation.", actions,
+    is_ps5 ? "RomM multi-file folders, ZIP/ZIP64 or PS5 images. Prepared to /data/homebrew for ShadowMountPlus; sources retained." : "PS4 .pkg; etaHEN DPI v2 required for installation.", actions,
     platform_id, offset);
 
   send_html_page(client_fd, html, html_len);
@@ -1015,11 +1086,47 @@ inspect_pkg(const char *path, char content_id[49]) {
 
 #include "ps5_files.h"
 
+static int
+streamed_zip_complete(const char *path) {
+  mz_zip_archive zip = {0};
+  if (!mz_zip_reader_init_file(&zip, path, 0)) return -1;
+  int valid = mz_zip_reader_get_num_files(&zip) > 0;
+  mz_zip_reader_end(&zip);
+  return valid ? 0 : -1;
+}
+
+/* Return only a top-level object's value, ignoring keys in nested metadata. */
+static const char *
+romm_root_value(const char *json, const char *key) {
+  unsigned depth = 0;
+  for (const char *p = json; *p; p++) {
+    if (*p == '{' || *p == '[') { depth++; continue; }
+    if (*p == '}' || *p == ']') { if (depth) depth--; continue; }
+    if (*p != '"') continue;
+    const char *start = ++p;
+    while (*p && *p != '"') {
+      if (*p == '\\' && p[1]) p++;
+      p++;
+    }
+    if (!*p) return NULL;
+    const char *value = p + 1;
+    while (*value == ' ' || *value == '\t' || *value == '\r' || *value == '\n') value++;
+    if (depth == 1 && *value == ':' && (size_t)(p-start) == strlen(key) &&
+        !memcmp(start, key, strlen(key))) {
+      value++;
+      while (*value == ' ' || *value == '\t' || *value == '\r' || *value == '\n') value++;
+      return value;
+    }
+  }
+  return NULL;
+}
+
 static void *
 run_transfer(void *unused) {
   transfer_job_t job;
   char api_path[64], fs_name[256], encoded_name[768], content_path[800];
-  char dest_path[600], content_id[49], result[256];
+  char dest_path[600], saved_name[256], content_id[49], result[256];
+  int multi_file = 0;
   char *alloc = NULL, *body;
   const char *p;
   (void)unused;
@@ -1043,16 +1150,21 @@ run_transfer(void *unused) {
   snprintf(api_path, sizeof api_path, "/api/roms/%ld", job.rom_id);
   body = romm_get(&job.cfg, job.auth, api_path, &alloc);
   if (!body) goto done;
-  p = strstr(body, "\"fs_name\":\"");
+  p = romm_root_value(body, "fs_name");
   fs_name[0] = '\0';
-  if (p) copy_json_string(p + strlen("\"fs_name\":\""), fs_name, sizeof fs_name);
+  if (p && *p == '"') copy_json_string(p + 1, fs_name, sizeof fs_name);
+  p = romm_root_value(body, "has_multiple_files");
+  multi_file = job.is_ps5 && p && !strncmp(p, "true", 4) &&
+               (p[4] == ',' || p[4] == '}' || p[4] == ' ' || p[4] == '\n' || p[4] == '\r');
   free(alloc); alloc = NULL;
-  if (strchr(fs_name, '/') || strchr(fs_name, '\\') || strlen(fs_name) < 5) {
+  snprintf(saved_name, sizeof saved_name, "%s", fs_name);
+  if (multi_file) snprintf(saved_name, sizeof saved_name, "romm-%ld-folder.zip", job.rom_id);
+  if (strchr(fs_name, '/') || strchr(fs_name, '\\') || !fs_name[0] || !strcmp(fs_name, ".") || !strcmp(fs_name, "..")) {
     snprintf(result, sizeof result, "Select a single downloadable file."); goto done;
   }
   if (job.is_ps5) {
-    if (!ps5_suffix(fs_name, ".zip") && !ps5_image_ext(fs_name)) {
-      snprintf(result, sizeof result, "PS5: use ZIP/ZIP64, .ffpkg, .exfat, .ffpfs or .ffpfsc. RAR/7z, split archives and retail PS5 PKGs are not supported.");
+    if (!multi_file && !ps5_suffix(fs_name, ".zip") && !ps5_image_ext(fs_name)) {
+      snprintf(result, sizeof result, "PS5: use a RomM multi-file folder, ZIP/ZIP64, .ffpkg, .exfat, .ffpfs or .ffpfsc. RAR/7z, split archives and retail PS5 PKGs are not supported.");
       goto done;
     }
     if (job.saved_only == INSPECT_SAVED) {
@@ -1061,7 +1173,7 @@ run_transfer(void *unused) {
   } else if (!ps5_suffix(fs_name, ".pkg")) {
     snprintf(result, sizeof result, "Select a single PS4 .pkg file."); goto done;
   }
-  int path_len = snprintf(dest_path, sizeof dest_path, "%s/%s", DOWNLOAD_DIR, fs_name);
+  int path_len = snprintf(dest_path, sizeof dest_path, "%s/%s", DOWNLOAD_DIR, saved_name);
   if (path_len < 0 || (size_t)path_len >= sizeof dest_path) {
     snprintf(result, sizeof result, "Download path is too long."); goto done;
   }
@@ -1073,7 +1185,10 @@ run_transfer(void *unused) {
     transfer_message("Downloading file...");
     notify("RomM: downloading %s", fs_name);
     printf("[download] GET %s -> %s\n", content_path, dest_path);
-    if (romm_download_to_file(&job.cfg, job.auth, content_path, dest_path)) {
+    if (multi_file) printf("[download] RomM multi-file game: receiving generated ZIP\n");
+    int failed = multi_file ? romm_download_to_file_mode(&job.cfg, job.auth, content_path, dest_path, 1) :
+                             romm_download_to_file(&job.cfg, job.auth, content_path, dest_path);
+    if (failed) {
       snprintf(result, sizeof result, "Download failed. Check the terminal for HTTP status and byte counts.");
       goto done;
     }
@@ -1086,7 +1201,7 @@ run_transfer(void *unused) {
       snprintf(result, sizeof result, "PS5 download complete. File saved; not extracted or prepared.");
     } else {
       transfer_message("Checking PS5 files...");
-      ps5_prepare(dest_path, fs_name, job.rom_id, result, sizeof result);
+      ps5_prepare(dest_path, saved_name, job.rom_id, result, sizeof result);
     }
     goto done;
   }
@@ -1123,12 +1238,15 @@ done:
 static void
 serve_transfer_status(int client_fd) {
   transfer_job_t job;
-  char html[4096], escaped[1600], actions[1024] = "";
+  char html[4096], escaped[1600], actions[1024] = "", progress[160];
   int len;
   pthread_mutex_lock(&transfer_lock);
   job = transfer_job;
   pthread_mutex_unlock(&transfer_lock);
   html_escape(job.message, escaped, sizeof escaped);
+  if (job.expected) snprintf(progress, sizeof progress, "%llu / %llu bytes (%.1f%%)",
+    job.received, job.expected, 100.0 * (double)job.received / (double)job.expected);
+  else snprintf(progress, sizeof progress, "%llu bytes received (total size not supplied)", job.received);
   if (!job.active && job.rom_id >= 0) {
     snprintf(actions, sizeof actions,
       "<a href=\"/install-saved?id=%ld&platform_id=%ld&offset=%d\">%s</a>"
@@ -1140,12 +1258,11 @@ serve_transfer_status(int client_fd) {
     "<!doctype html><html><head><meta charset=\"utf-8\">%s<title>RomM transfer</title>"
     "<style>body{background:#111;color:#eee;font-family:sans-serif;font-size:2.2vw}"
     "a{color:#8cf;display:block;padding:1.5vw}a:focus{background:#345}</style></head><body>"
-    "<h1>RomM transfer</h1><p>%s</p><p>%llu / %llu bytes (%.1f%%)</p>"
+    "<h1>RomM transfer</h1><p>%s</p><p>%s</p>"
     "<p>%s</p>%s<a href=\"/status\">Refresh status</a>"
     "<a href=\"/rom?id=%ld&platform_id=%ld&offset=%d\">Back to game</a></body></html>",
     job.active ? "<meta http-equiv=\"refresh\" content=\"3;url=/status\">" : "",
-    escaped, job.received, job.expected,
-    job.expected ? 100.0 * (double)job.received / (double)job.expected : 0.0,
+    escaped, progress,
     job.active ? "Work continues if you leave this page. No need to click Download again." : "",
     actions, job.rom_id, job.platform_id, job.offset);
   send_html_page(client_fd, html, (size_t)len);

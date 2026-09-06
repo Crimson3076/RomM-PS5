@@ -169,7 +169,10 @@ int main(int argc, char **argv) {
         self.assertEqual(result.returncode, 1)
         self.assertEqual((game / 'keep').read_text(), 'untouched')
 
-    def test_ps5_worker_download_and_prepare(self):
+    def test_ps5_worker_folder_download_and_prepare(self):
+        self.test_ps5_worker_download_and_prepare(folder=True)
+
+    def test_ps5_worker_download_and_prepare(self, folder=False):
         data = self.archive('PPSA00001-app0/')
         requests = []
         class Handler(BaseHTTPRequestHandler):
@@ -178,11 +181,14 @@ int main(int argc, char **argv) {
                 if self.path == '/api/platforms':
                     body = b'[{"id":1,"slug":"ps4"},{"id":2,"slug":"ps5"}]'
                 elif self.path == '/api/roms/7':
-                    body = b'{"fs_name":"game.zip"}'
+                    body = (json.dumps({"nested": {"fs_name": "wrong.pkg", "has_multiple_files": False},
+                                       "fs_name": "Small Game" if folder else "game.zip",
+                                       "has_multiple_files": folder}).encode())
                 else:
                     body = data
                 self.send_response(200)
-                self.send_header('Content-Length', str(len(body)))
+                if not (folder and '/content/' in self.path):
+                    self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
             def log_message(self, *args):
@@ -203,7 +209,9 @@ int main(int argc, char **argv) {
                 else:
                     self.assertIn('[ps5] prepared=', result.stdout)
             self.assertEqual(sum('/content/' in x for x in requests), 1)
-            self.assertEqual((self.root / 'game.zip').read_bytes(), data)
+            self.assertEqual((self.root / ('romm-7-folder.zip' if folder else 'game.zip')).read_bytes(), data)
+            if folder:
+                self.assertIn('/api/roms/7/content/Small%20Game', requests)
             self.assertTrue((self.root / 'games/romm-7/eboot.bin').exists())
         finally:
             server.shutdown(); thread.join(); server.server_close()

@@ -178,3 +178,17 @@ with 64-bit file offsets and callback extraction. No external unzip binary or
 system zlib is required. Archives are limited to 100,000 entries and 32 levels
 of nesting. Host tests use ZIP64 fixtures; multi-gigabyte console transfers and
 actual ShadowMountPlus discovery still require on-device testing.
+
+### RomM multi-file PS5 games
+
+PS5 entries marked `has_multiple_files` by RomM are downloaded through its
+normal content endpoint as a generated ZIP, including games stored as folders
+without a `.zip` extension. The payload saves these as
+`/data/romm-ps5/downloads/romm-<id>-folder.zip`. Use **Prepare saved PS5 file**
+to retry extraction without downloading again.
+
+Generated ZIP downloads support Content-Length, chunked, and connection-close
+framing. When RomM does not provide a total size, status shows bytes received.
+The ZIP directory must be readable before the temporary download replaces the
+saved archive; extraction still performs CRC and safe-path checks. A folder
+must contain a single game root with `eboot.bin` and `sce_sys/param.json`.
